@@ -1,7 +1,7 @@
 /* Shop-Racing Archives audio. No credentials are stored or sent outside this session. */
 (function () {
   'use strict';
-  const VERSION = '1.0.0';
+  const VERSION = '1.0.1';
   const MAX_BYTES = 512 * 1024 * 1024;
   function safeName(value) {
     let s = String(value || 'audio').normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
@@ -103,18 +103,34 @@
   }
   if (window.__shopRacingArchives) return;
   window.__shopRacingArchives = { version: VERSION };
-  let sessionURL = null, capturedHeaders = {}, records = [], busy = false, complete = false, controller;
+  let sessionURL = null, capturedHeaders = {}, sessionMethod = 'GET', sessionCredentials = 'same-origin';
+  let records = [], busy = false, complete = false, controller;
   let panel, status, queryBox, loadButton, zipButton, tbody, licence, progress, cancelButton;
   const candidates = new Map();
-  function audioRequest(value) {
+  function audioRequest(value, observed) {
     try {
       const u = new URL(String(value), location.href);
-      return u.origin === location.origin && /\/ptt\/audio\/?$/.test(u.pathname) ? u : null;
+      return (observed || u.origin === location.origin) && /^https?:$/.test(u.protocol) &&
+        !u.username && !u.password && /\/ptt\/audio\/?$/.test(u.pathname) ? u : null;
     } catch (_) { return null; }
   }
-  function capture(value, headers) {
-    const u = audioRequest(value); if (!u) return;
+  function capture(value, headers, method, body, credentials, observed) {
+    const u = audioRequest(value, observed); if (!u) return;
+    const verb = String(method || 'GET').toUpperCase(); if (!['GET', 'POST'].includes(verb)) return;
+    // Reuse form parameters only. Never inspect unrelated requests or persistent storage.
+    if (verb === 'POST' && body != null) {
+      let pairs;
+      if (typeof body === 'string') {
+        if (/^\s*[\[{]/.test(body)) return; // JSON replay requires an explicit endpoint adapter.
+        pairs = new URLSearchParams(body);
+      } else if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) pairs = body;
+      else if (typeof FormData !== 'undefined' && body instanceof FormData) {
+        pairs = body; for (const [, v] of pairs) if (typeof v !== 'string') return;
+      } else return;
+      for (const [k, v] of pairs) u.searchParams.set(k, v);
+    }
     sessionURL = u; capturedHeaders = { ...(headers || {}) };
+    sessionMethod = verb; sessionCredentials = credentials === 'include' ? 'include' : 'same-origin';
     if (queryBox) { queryBox.hidden = true; queryBox.querySelector('input').value = ''; }
     if (status && !busy) status.textContent = 'Session détectée. Saisissez la licence puis chargez les archives.';
   }
@@ -124,9 +140,9 @@
   const xhrInfo = new WeakMap();
   XMLHttpRequest.prototype.open = function (method, url) {
     const result = originalOpen.apply(this, arguments);
-    const u = String(method).toUpperCase() === 'GET' && audioRequest(url);
-    xhrInfo.set(this, { url: u, headers: {} });
-    if (u) capture(u); return result;
+    const u = audioRequest(url, true);
+    xhrInfo.set(this, { url: u, method: String(method).toUpperCase(), headers: {} });
+    return result;
   };
   XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
     const result = originalSetHeader.apply(this, arguments), info = xhrInfo.get(this);
@@ -134,8 +150,31 @@
     return result;
   };
   XMLHttpRequest.prototype.send = function () {
-    const info = xhrInfo.get(this); if (info && info.url) capture(info.url, info.headers);
+    const info = xhrInfo.get(this);
+    try {
+      if (info && info.url) capture(info.url, info.headers, info.method, arguments[0], this.withCredentials ? 'include' : 'same-origin', true);
+    } catch (_) { /* Always preserve the platform's native request. */ }
     return originalSend.apply(this, arguments);
+  };
+  const nativeFetch = window.fetch ? window.fetch.bind(window) : fetch;
+  if (window.fetch) window.fetch = function (input, options) {
+    // Observe the platform's request; our own requests use nativeFetch and cannot replace the session.
+    try {
+      const opts = options || {}, isRequest = typeof Request !== 'undefined' && input instanceof Request;
+      const url = isRequest ? input.url : input;
+      if (audioRequest(url, true)) {
+        const method = opts.method || (isRequest ? input.method : 'GET');
+        const headers = {};
+        new Headers(opts.headers || (isRequest ? input.headers : undefined)).forEach((v, k) => {
+          if (/^(authorization|x-.*token|token|sessionid|x-requested-with)$/i.test(k)) headers[k] = v;
+        });
+        const credentials = opts.credentials || (isRequest ? input.credentials : 'same-origin');
+        if (isRequest && method.toUpperCase() === 'POST' && opts.body === undefined)
+          input.clone().text().then(body => capture(url, headers, method, body, credentials, true)).catch(() => {});
+        else capture(url, headers, method, opts.body, credentials, true);
+      }
+    } catch (_) { /* Observation must never break the platform's original request. */ }
+    return nativeFetch(input, options);
   };
   function discover() {
     if (sessionURL) return true;
@@ -157,9 +196,25 @@
   }
   function message(text) { status.textContent = text; }
   async function jsonRequest(url, headers, signal) {
-    const r = await fetch(url, { credentials: 'same-origin', headers, signal, cache: 'no-store', redirect: 'error' });
+    const timed = new AbortController();
+    const abort = () => timed.abort(); signal.addEventListener('abort', abort, { once: true });
+    if (signal.aborted) timed.abort();
+    let expired = false;
+    const timer = setTimeout(() => { expired = true; timed.abort(); }, 30000);
+    try {
+    const opts = { credentials: sessionCredentials, headers: { ...headers }, signal: timed.signal, cache: 'no-store', redirect: 'error', method: sessionMethod };
+    if (sessionMethod === 'POST') {
+      opts.headers['Content-Type'] = 'application/x-www-form-urlencoded;charset=UTF-8';
+      opts.body = url.searchParams.toString();
+    }
+    const r = await nativeFetch(url, opts);
     if (!r.ok) throw new Error(r.status === 401 || r.status === 403 ? 'Session expirée ou accès refusé.' : 'Erreur serveur pendant le chargement.');
     try { return await r.json(); } catch (_) { throw new Error('Réponse serveur non JSON. Rouvrez les archives natives.'); }
+    } catch (e) {
+      if (expired) throw new Error('Le serveur ne répond pas depuis 30 secondes. Réessayez après une recherche audio habituelle.');
+      if (e instanceof TypeError) throw new Error('Connexion au serveur refusée ou bloquée. Relancez une recherche audio habituelle pour détecter la session.');
+      throw e;
+    } finally { clearTimeout(timer); signal.removeEventListener('abort', abort); }
   }
   function mediaURL(value, base) {
     if (typeof value !== 'string' || !value) return null;
@@ -181,7 +236,7 @@
     discover();
     if (!sessionURL) {
       const raw = queryBox.querySelector('input').value.trim();
-      if (!raw) { queryBox.hidden = false; message('Ouvrez une recherche audio dans le portail pour détecter la session, ou renseignez Query ci-dessous.'); return; }
+      if (!raw) { queryBox.hidden = false; message('Session non détectée : fermez cette fenêtre, ouvrez les enregistrements audio habituels du portail et lancez une recherche. Revenez ensuite ici et cliquez sur Charger les archives. Query reste une solution de secours.'); return; }
       let manual;
       try { manual = raw.startsWith('?') || !raw.includes('://') ? new URL('/ptt/audio?' + raw.replace(/^\?/, ''), location.origin) : audioRequest(raw); }
       catch (_) { message('Query invalide.'); return; }
