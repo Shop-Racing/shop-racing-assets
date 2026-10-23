@@ -1,7 +1,7 @@
 /* Shop-Racing Archives audio. No credentials are stored or sent outside this session. */
 (function () {
   'use strict';
-  const VERSION = '1.3.2';
+  const VERSION = '1.3.3';
   const MAX_BYTES = 512 * 1024 * 1024;
   const AUDIO_PATH = /\/ptt\/audio(?:;jsessionid=[^/;]+)?\/?$/i;
   function groupPath(path) {
@@ -147,8 +147,13 @@
     const result = [], seen = new Set(); let pages = 1;
     const cap = kind === 'group' ? 30 : 50;
     for (let page = 0; page < cap; page++) {
-      const u = new URL(base); u.searchParams.set('limit', '100'); u.searchParams.set('page', String(page));
-      const { rows, meta } = listEnvelope(await request(u), kind);
+      const u = new URL(base);
+      u.searchParams.set('limit', kind === 'group' ? '100' : (base.searchParams.get('limit') || '100'));
+      u.searchParams.set('page', String(page));
+      let envelope;
+      try { envelope = listEnvelope(await request(u), kind); }
+      catch (e) { e.partialRows = result.slice(); throw e; }
+      const { rows, meta } = envelope;
       const signature = JSON.stringify(rows);
       if (rows.length && seen.has(signature)) throw new Error('Page répétée : recherche incomplète.');
       seen.add(signature); result.push(...rows); if (progress) progress(result.length);
@@ -177,6 +182,7 @@
   let licenceList, suggestionsTask = null;
   const sessionWaiters = new Set();
   let nativeQueryIssue = '';
+  let nativeAudioResult = null;
   const candidates = new Map();
   function audioRequest(value, observed) {
     try {
@@ -208,6 +214,22 @@
     if (status && !busy) status.textContent = 'Session détectée. Saisissez la licence puis chargez les archives.';
   }
   const nativeFetch = window.fetch ? window.fetch.bind(window) : fetch;
+  function observeAudioCompletion(xhr, info) {
+    const finished = () => {
+      try {
+        if (xhr.status < 200 || xhr.status >= 300) return;
+        const payload = xhr.responseType === 'json' ? xhr.response : JSON.parse(xhr.responseText);
+        listEnvelope(payload, 'audio');
+        nativeAudioResult = { url: new URL(info.url), payload };
+        capture(info.url, info.headers, info.method, info.body, xhr.withCredentials ? 'include' : 'same-origin', true);
+      } catch (_) { /* A failed or unrelated response cannot replace a working session. */ }
+    };
+    if (xhr.addEventListener) xhr.addEventListener('loadend', finished, { once: true });
+    else {
+      const previous = xhr.onload;
+      xhr.onload = function () { if (previous) previous.apply(this, arguments); finished(); };
+    }
+  }
   function installXHRHook() {
   const originalOpen = XMLHttpRequest.prototype.open;
   const originalSetHeader = XMLHttpRequest.prototype.setRequestHeader;
@@ -227,7 +249,7 @@
   XMLHttpRequest.prototype.send = function () {
     const info = xhrInfo.get(this);
     try {
-      if (info && info.url) capture(info.url, info.headers, info.method, arguments[0], this.withCredentials ? 'include' : 'same-origin', true);
+      if (info && info.url) { info.body = arguments[0]; observeAudioCompletion(this, info); }
     } catch (_) { /* Always preserve the platform's native request. */ }
     return originalSend.apply(this, arguments);
   };
@@ -277,7 +299,7 @@
         proto.send = function () {
           try {
             const item = info.get(this);
-            if (item && item.url) capture(item.url, item.headers, item.method, arguments[0], this.withCredentials ? 'include' : 'same-origin', true);
+            if (item && item.url) { item.body = arguments[0]; observeAudioCompletion(this, item); }
           } catch (_) {}
           return send.apply(this, arguments);
         };
@@ -588,7 +610,18 @@
         // Changing it to the group API's action can change permissions or hit another backend route.
         const u = new URL(base); u.searchParams.set('group_id', g.id);
         u.searchParams.set('order_type', 'desc');
-        const rows = await portalPages(u, 'audio', x => jsonRequest(x, headers, signal), n => message(g.label + ' : ' + n + ' audios reçus…'));
+        let rows;
+        try { rows = await portalPages(u, 'audio', x => {
+          const cached = nativeAudioResult;
+          const same = cached && x.origin === cached.url.origin && x.pathname === cached.url.pathname &&
+            Array.from(new Set([...x.searchParams.keys(), ...cached.url.searchParams.keys()])).every(key =>
+              x.searchParams.get(key) === cached.url.searchParams.get(key));
+          return same ? Promise.resolve(cached.payload) : jsonRequest(x, headers, signal);
+        }, n => message(g.label + ' : ' + n + ' audios reçus…')); }
+        catch (e) {
+          for (const a of e.partialRows || []) { const r = normalizeAudio(a, g.label, base); if (!unique.has(r.id)) unique.set(r.id, r); }
+          records = Array.from(unique.values()); throw e;
+        }
         for (const a of rows) { const r = normalizeAudio(a, g.label, base); if (!unique.has(r.id)) unique.set(r.id, r); }
         records = Array.from(unique.values());
       }
@@ -597,7 +630,12 @@
       const missing = records.filter(r => !r.url).length;
       message(records.length + ' audios à partir du ' + chosenDate + ', du plus ancien au plus récent.' + (missing ? ' ' + missing + ' sans lien exploitable.' : ''));
     } catch (e) {
-      records = []; tbody.replaceChildren(); message(signal.aborted ? 'Chargement annulé.' : stage + ' : ' + e.message);
+      if (signal.aborted) { records = []; tbody.replaceChildren(); message('Chargement annulé.'); }
+      else {
+        records.sort((a, b) => (Number.isFinite(a.time) ? a.time : Infinity) - (Number.isFinite(b.time) ? b.time : Infinity) || a.id.localeCompare(b.id));
+        renderRows();
+        message(stage + ' : ' + e.message + (records.length ? ' Résultats incomplets : ' + records.length + ' audios affichés. Exports désactivés.' : ''));
+      }
     } finally { progress.value = 0; setBusy(false); }
   }
   function filename(r, index, type) {
