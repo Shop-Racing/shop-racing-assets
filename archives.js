@@ -1,7 +1,7 @@
 /* Shop-Racing Archives audio. No credentials are stored or sent outside this session. */
 (function () {
   'use strict';
-  const VERSION = '1.2.0';
+  const VERSION = '1.2.1';
   const MAX_BYTES = 512 * 1024 * 1024;
   const AUDIO_PATH = /\/ptt\/audio(?:;jsessionid=[^/;]+)?\/?$/i;
   function groupPath(path) {
@@ -30,6 +30,13 @@
       const n = Number(value); return n < 1e12 ? n * 1000 : n;
     }
     return Date.parse(String(value).replace(' ', 'T'));
+  }
+  function recordingDates(items) {
+    const pad = n => String(n).padStart(2, '0');
+    const dates = Array.from(new Set(items.filter(r => Number.isFinite(r.time)).map(r => {
+      const d = new Date(r.time); return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+    }))).sort();
+    return !dates.length ? 'Date-inconnue' : dates.length === 1 ? dates[0] : dates[0] + '_au_' + dates[dates.length - 1];
   }
   const crcTable = Uint32Array.from({ length: 256 }, (_, n) => {
     let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; return c >>> 0;
@@ -149,7 +156,7 @@
     throw new Error('Limite de pagination atteinte : recherche incomplète.');
   }
   if (typeof window === 'undefined' && typeof module === 'object' && module.exports) {
-    module.exports = { safeName, roleLicense, dropdownGroup, timestamp, crc32, makeZip, wavHeader, monoPCM, filename, listEnvelope, paginate, portalPages, AUDIO_PATH, groupPath }; return;
+    module.exports = { safeName, roleLicense, dropdownGroup, timestamp, recordingDates, crc32, makeZip, wavHeader, monoPCM, filename, listEnvelope, paginate, portalPages, AUDIO_PATH, groupPath }; return;
   }
   if (window.__shopRacingArchives && typeof window.__shopRacingArchives.restore === 'function') {
     window.__shopRacingArchives.restore(); return;
@@ -158,7 +165,7 @@
   window.__shopRacingArchives = { version: VERSION };
   let sessionURL = null, capturedHeaders = {}, sessionMethod = 'GET', sessionCredentials = 'same-origin';
   let records = [], busy = false, complete = false, controller;
-  let panel, status, queryBox, loadButton, zipButton, mergeButton, tbody, licence, progress, cancelButton;
+  let panel, status, queryBox, loadButton, nativeQueryButton, zipButton, mergeButton, tbody, licence, progress, cancelButton;
   let portalHost, restoreObserver, waitingForBody = false;
   let licenceList, suggestionsTask = null;
   const sessionWaiters = new Set();
@@ -344,11 +351,12 @@
     }
     return found;
   }
-  async function detectWithNativeQuery() {
-    if (discover()) return true;
+  async function detectWithNativeQuery(force) {
+    if (!force && discover()) return true;
     let button;
     for (const root of portalRoots()) {
-      button = Array.from(root.querySelectorAll('.audio-records button')).find(b => !b.disabled && /^query$/i.test(String(b.textContent || '').trim()));
+      button = Array.from(root.querySelectorAll('.audio-records .filter-box .filter-item > button.el-button--primary')).find(b => !b.disabled);
+      if (!button) button = Array.from(root.querySelectorAll('.audio-records button')).find(b => !b.disabled && /^query$/i.test(String(b.textContent || '').trim()));
       if (!button) button = Array.from(root.querySelectorAll('button, [role="button"]')).find(b =>
         !b.disabled && /^query$/i.test(String(b.textContent || '').trim()) && (!b.getClientRects || b.getClientRects().length));
       if (button) break;
@@ -400,6 +408,7 @@
   }
   function setBusy(value) {
     busy = value; loadButton.disabled = value; zipButton.disabled = value || !complete || !records.length;
+    nativeQueryButton.disabled = value;
     mergeButton.disabled = value || !complete || !records.length;
     licence.disabled = value; cancelButton.hidden = !value;
   }
@@ -562,7 +571,7 @@
     try {
       context = new Audio({ sampleRate: 24000 });
       if (context.resume) await context.resume();
-      const chunks = []; let size = 0, failures = 0;
+      const chunks = [], mergedRecords = []; let size = 0, failures = 0;
       progress.max = records.length; progress.value = 0;
       for (let i = 0; i < records.length; i++) {
         if (signal.aborted) throw new DOMException('Cancelled', 'AbortError');
@@ -572,13 +581,13 @@
           const decoded = await context.decodeAudioData(file.bytes.buffer);
           if (decoded.length * 2 + size > MAX_BYTES) throw new RangeError('Fusion limitée à 512 Mo. Exportez une période plus courte.');
           if (signal.aborted) throw new DOMException('Cancelled', 'AbortError');
-          const pcm = monoPCM(decoded); chunks.push(pcm); size += pcm.length;
+          const pcm = monoPCM(decoded); chunks.push(pcm); mergedRecords.push(records[i]); size += pcm.length;
         } catch (e) { if (signal.aborted || e instanceof RangeError) throw e; failures++; }
         progress.value = i + 1;
       }
       if (!chunks.length) { message('Aucun audio décodable : accès CORS ou format non pris en charge. Aucun fichier créé.'); return; }
       const blob = new Blob([wavHeader(size, context.sampleRate), ...chunks], { type: 'audio/wav' });
-      const name = 'Shop-Racing_Licence-' + safeName(licence.value) + '_Echanges-chronologiques' + (failures ? '_PARTIEL' : '') + '.wav';
+      const name = 'Shop-Racing_' + recordingDates(mergedRecords) + '_Licence-' + safeName(licence.value) + '_Echanges-chronologiques' + (failures ? '_PARTIEL' : '') + '.wav';
       message('Audio unique prêt : ' + chunks.length + '/' + records.length + ' enregistrements, à la suite sans les temps de silence entre échanges.' + (failures ? ' ' + failures + ' échecs : fichier partiel.' : ''));
       const save = el('button', 'Télécharger l’audio unique', status), url = URL.createObjectURL(blob);
       save.onclick = () => {
@@ -652,6 +661,16 @@
     licence.setAttribute('list', 'sr-licences'); licence.setAttribute('autocomplete', 'off');
     licenceList = el('datalist', null, panel); licenceList.id = 'sr-licences';
     loadButton = el('button', 'Charger les archives', tools); loadButton.onclick = load;
+    nativeQueryButton = el('button', 'Lancer Query de la page', tools);
+    nativeQueryButton.onclick = async () => {
+      if (busy || suggestionsTask) return;
+      setBusy(true); let detected = false;
+      try { detected = await detectWithNativeQuery(true); }
+      finally { setBusy(false); }
+      if (!detected) { message('Bouton Query de la page introuvable ou aucune requête audio détectée. Ouvrez Audio Records, puis réessayez.'); return; }
+      if (/^\d+$/.test(licence.value.trim())) await load();
+      else { message('Query lancé et session détectée. Choisissez votre licence.'); suggestLicences(); }
+    };
     zipButton = el('button', 'Exporter tous les audios en ZIP', tools); zipButton.disabled = true; zipButton.onclick = exportZip;
     mergeButton = el('button', 'Créer un audio unique (WAV)', tools); mergeButton.disabled = true; mergeButton.onclick = exportMerged;
     cancelButton = el('button', 'Annuler', tools); cancelButton.hidden = true; cancelButton.onclick = () => controller && controller.abort();
