@@ -1,7 +1,7 @@
 /* Shop-Racing Archives audio. No credentials are stored or sent outside this session. */
 (function () {
   'use strict';
-  const VERSION = '1.4.1';
+  const VERSION = '1.5.0';
   const MAX_BYTES = 512 * 1024 * 1024;
   const AUDIO_PATH = /\/ptt\/audio(?:;jsessionid=[^/;]+)?\/?$/i;
   function groupPath(path) {
@@ -183,6 +183,21 @@
   const sessionWaiters = new Set();
   let nativeQueryIssue = '';
   let nativeAudioResult = null;
+  let queuePlayer, queueButton, queueStop, queueStatus, queueIndex = -1, queueSkipped = 0;
+  const aliasFields = new Map();
+  let displayNames = {};
+  try {
+    const stored = JSON.parse(window.localStorage?.getItem('shop-racing-archive-labels') || '{}');
+    if (stored && typeof stored === 'object' && !Array.isArray(stored)) displayNames = stored;
+  } catch (_) {}
+  function groupLabel(record) {
+    const group = roleLicense(record.group);
+    const label = group && displayNames[group.license]?.[group.role];
+    return typeof label === 'string' && label.trim() ? label.slice(0, 80) : record.group;
+  }
+  function refreshLabelFields() {
+    for (const [role, input] of aliasFields) input.value = displayNames[licence.value.trim()]?.[role] || '';
+  }
   const candidates = new Map();
   function audioRequest(value, observed) {
     try {
@@ -504,7 +519,7 @@
       option.setAttribute('aria-selected', String(licence.value === number));
       if (licence.value === number) option.className = 'selected';
       option.onmousedown = event => event.preventDefault();
-      option.onclick = () => { licence.value = number; showLicenceMenu(false); licence.focus(); };
+      option.onclick = () => { licence.value = number; refreshLabelFields(); showLicenceMenu(false); licence.focus(); };
     }
     if (!matches.length) el('li', licenceNumbers.length ? 'Aucune licence correspondante' : 'Chargement des licences…', licenceList).className = 'licence-empty';
   }
@@ -588,6 +603,7 @@
     busy = value; loadButton.disabled = value; zipButton.disabled = value || !complete || !records.length;
     dateInput.disabled = value;
     mergeButton.disabled = value || !complete || !records.length;
+    queueButton.disabled = value || !records.some(r => r.url);
     licence.disabled = value; licenceToggle.disabled = value; if (value) showLicenceMenu(false); cancelButton.hidden = !value;
   }
   function message(text) { status.textContent = text; }
@@ -628,6 +644,7 @@
   }
   async function load() {
     if (busy) return;
+    stopQueue();
     const number = licence.value.trim();
     if (!/^\d+$/.test(number)) { message('Saisissez un numéro de licence composé de chiffres.'); licence.focus(); return; }
     const chosenDate = searchDate(dateInput.value);
@@ -744,21 +761,42 @@
     records.forEach((r, i) => {
       const tr = el('tr', null, fragment);
       el('td', Number.isFinite(r.time) ? new Date(r.time).toLocaleString('fr-FR') : 'Date inconnue', tr);
-      el('td', r.group, tr); el('td', r.user, tr);
+      el('td', groupLabel(r), tr).title = r.group; el('td', r.user, tr);
       const cell = el('td', null, tr);
       if (r.url) {
         const audio = el('audio', null, cell); audio.controls = true; audio.preload = 'none'; audio.src = r.url;
         audio.setAttribute('aria-label', 'Écouter l’audio ' + (i + 1));
+        audio.onplay = () => stopQueue();
         audio.addEventListener('error', () => { const note = cell.querySelector('span') || el('span', '', cell); note.textContent = 'Lecture indisponible.'; });
       } else el('span', 'Lien indisponible', cell);
       const save = el('button', 'Télécharger', el('td', null, tr)); save.disabled = !r.downloadURL && !r.url;
       save.onclick = async () => {
         if (busy) return; setBusy(true); controller = new AbortController(); save.disabled = true;
-        try { const f = await audioBytes(r, controller.signal, MAX_BYTES); download(new Blob([f.bytes], { type: f.type }), filename(r, i, f.type)); message('Téléchargement demandé au navigateur.'); }
+        try { const f = await audioBytes(r, controller.signal, MAX_BYTES); download(new Blob([f.bytes], { type: f.type }), filename({ ...r, group: groupLabel(r) }, i, f.type)); message('Téléchargement demandé au navigateur.'); }
         catch (_) { message('Téléchargement impossible ou annulé. Le serveur peut bloquer l’accès CORS ; aucun fichier n’a été créé.'); }
         finally { save.disabled = false; setBusy(false); }
       };
     }); tbody.appendChild(fragment);
+  }
+  function stopQueue(text) {
+    queueIndex = -1;
+    if (!queuePlayer) return;
+    queuePlayer.pause(); queuePlayer.removeAttribute('src'); queuePlayer.load?.();
+    queueButton.textContent = 'Tout écouter'; queueStop.disabled = true;
+    queueStatus.textContent = text || 'Lecture des échanges dans l’ordre chronologique.';
+  }
+  function updateQueueLabel() {
+    const r = records[queueIndex]; if (!r) return;
+    queueStatus.textContent = 'Écoute ' + (queueIndex + 1) + '/' + records.length + ' · ' + groupLabel(r) + ' · ' + r.user +
+      (Number.isFinite(r.time) ? ' · ' + new Date(r.time).toLocaleString('fr-FR') : '') + (queueSkipped ? ' · ' + queueSkipped + ' indisponibles ignorés' : '');
+  }
+  async function playQueue(index) {
+    while (index < records.length && !records[index].url) { index++; queueSkipped++; }
+    if (index >= records.length) { stopQueue('Lecture terminée.' + (queueSkipped ? ' ' + queueSkipped + ' audios indisponibles ignorés.' : '')); return; }
+    queueIndex = index; queueStop.disabled = false; updateQueueLabel();
+    queuePlayer.src = records[index].url;
+    try { await queuePlayer.play(); }
+    catch (_) { if (queueIndex === index) { queueButton.textContent = 'Reprendre'; queueStatus.textContent += ' — Cliquez sur Reprendre pour lancer la lecture.'; } }
   }
   async function exportMerged() {
     if (busy || !complete || !records.length) return;
@@ -808,7 +846,7 @@
         message('Préparation du ZIP : ' + (i + 1) + '/' + records.length + '…');
         try {
           const f = await audioBytes(records[i], signal, MAX_BYTES - size); size += f.bytes.length;
-          files.push({ name: filename(records[i], i, f.type), bytes: f.bytes });
+          files.push({ name: filename({ ...records[i], group: groupLabel(records[i]) }, i, f.type), bytes: f.bytes });
         } catch (e) { if (signal.aborted) throw e; failures.push(i + 1); }
         progress.value = i + 1;
       }
@@ -887,7 +925,7 @@
     licenceList = el('ul', null, combo); licenceList.id = 'sr-licences'; licenceList.className = 'licence-menu'; licenceList.hidden = true; licenceList.setAttribute('role', 'listbox');
     licenceToggle.onclick = () => showLicenceMenu(licenceList.hidden);
     licence.onclick = () => showLicenceMenu(true);
-    licence.oninput = () => showLicenceMenu(true, true);
+    licence.oninput = () => { showLicenceMenu(true, true); refreshLabelFields(); };
     licence.onkeydown = event => {
       if (event.key === 'Escape') { showLicenceMenu(false); return; }
       if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
@@ -903,6 +941,38 @@
     zipButton = el('button', 'Exporter tous les audios en ZIP', tools); zipButton.disabled = true; zipButton.onclick = exportZip;
     mergeButton = el('button', 'Créer un audio unique (WAV)', tools); mergeButton.disabled = true; mergeButton.onclick = exportMerged;
     cancelButton = el('button', 'Annuler', tools); cancelButton.hidden = true; cancelButton.onclick = () => controller && controller.abort();
+    const labels = el('details', null, panel); el('summary', 'Modifier les libellés des groupes', labels);
+    el('p', 'Pour la licence choisie : personnalisez les noms affichés et exportés. Laissez vide pour garder le nom d’origine. Réglages mémorisés dans ce navigateur.', labels);
+    for (const role of ['VOITURE', 'INGENIEUR', 'MECANO', 'MECANICIEN']) {
+      const row = el('label', role, labels), field = el('input', null, row); field.maxLength = 80;
+      field.placeholder = role === 'VOITURE' ? 'Ex. Voiture n°23' : 'Libellé personnalisé'; aliasFields.set(role, field);
+    }
+    const saveLabels = el('button', 'Enregistrer les libellés', labels);
+    saveLabels.onclick = () => {
+      const number = licence.value.trim();
+      if (!/^\d+$/.test(number)) { message('Choisissez une licence avant de modifier ses libellés.'); return; }
+      const names = {}; for (const [role, field] of aliasFields) { const value = field.value.trim().slice(0, 80); if (value) names[role] = value; }
+      displayNames[number] = names;
+      let persisted = true;
+      try { if (!window.localStorage) persisted = false; else window.localStorage.setItem('shop-racing-archive-labels', JSON.stringify(displayNames)); } catch (_) { persisted = false; }
+      renderRows(); updateQueueLabel();
+      message('Libellés mis à jour pour la licence ' + number + (persisted ? '.' : ' pour cette session (stockage local indisponible).'));
+    };
+    const listening = el('div', null, panel); listening.className = 'tools';
+    queueButton = el('button', 'Tout écouter', listening); queueButton.disabled = true;
+    queueStop = el('button', 'Arrêter', listening); queueStop.disabled = true; queueStop.onclick = () => stopQueue();
+    queuePlayer = el('audio', null, listening); queuePlayer.controls = true; queuePlayer.preload = 'none'; queuePlayer.setAttribute('aria-label', 'Lecture successive des archives');
+    queueStatus = el('p', 'Lecture des échanges dans l’ordre chronologique.', panel); queueStatus.setAttribute('role', 'status');
+    queuePlayer.onplay = () => { queueButton.textContent = 'Pause'; };
+    queuePlayer.onpause = () => { if (queueIndex >= 0) queueButton.textContent = 'Reprendre'; };
+    queuePlayer.onended = () => { if (queueIndex >= 0) playQueue(queueIndex + 1); };
+    queuePlayer.onerror = () => { if (queueIndex >= 0) { queueSkipped++; playQueue(queueIndex + 1); } };
+    queueButton.onclick = async () => {
+      if (busy) return;
+      if (queueIndex >= 0) { if (queuePlayer.paused) { try { await queuePlayer.play(); } catch (_) {} } else queuePlayer.pause(); return; }
+      for (const audio of tbody.querySelectorAll('audio')) audio.pause();
+      queueSkipped = 0; await playQueue(0);
+    };
     queryBox = el('details', null, panel); queryBox.hidden = true; queryBox.open = true;
     el('summary', 'Query de session — solution de secours', queryBox);
     const queryLabel = el('label', 'Query', queryBox); const input = el('input', null, queryLabel);
@@ -923,6 +993,7 @@
         const selected = Array.from(dropdownGroups().values());
         if (selected.length === 1) licence.value = selected[0].license;
       }
+      refreshLabelFields();
       if (!busy && !records.length) message(sessionURL ? 'Session détectée. Saisissez votre licence.' : 'Ouvrez une recherche audio dans le portail, puis cliquez sur Charger les archives.');
       licence.focus();
       suggestLicences();
