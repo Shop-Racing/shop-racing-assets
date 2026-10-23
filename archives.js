@@ -1,7 +1,7 @@
 /* Shop-Racing Archives audio. No credentials are stored or sent outside this session. */
 (function () {
   'use strict';
-  const VERSION = '1.0.4';
+  const VERSION = '1.0.5';
   const MAX_BYTES = 512 * 1024 * 1024;
   const AUDIO_PATH = /\/ptt\/audio(?:;jsessionid=[^/;]+)?\/?$/i;
   function groupPath(path) {
@@ -285,7 +285,7 @@
     let expired = false;
     const timer = setTimeout(() => { expired = true; timed.abort(); }, 30000);
     try {
-    const opts = { credentials: sessionCredentials, headers: { ...headers }, signal: timed.signal, cache: 'no-store', redirect: 'error', method: sessionMethod };
+    const opts = { credentials: sessionCredentials, headers: { ...headers }, signal: timed.signal, cache: 'no-store', method: sessionMethod };
     if (sessionMethod === 'POST') {
       opts.headers['Content-Type'] = 'application/x-www-form-urlencoded;charset=UTF-8';
       opts.body = url.searchParams.toString();
@@ -349,7 +349,9 @@
       const unique = new Map(); let index = 0;
       for (const g of candidates.values()) {
         index++; message('Chargement du groupe ' + index + '/' + candidates.size + '…');
-        const u = new URL(base); u.searchParams.set('group_id', g.id); u.searchParams.set('method', 'get');
+        // The audio action belongs to the captured session (for example getByUser).
+        // Changing it to the group API's action can change permissions or hit another backend route.
+        const u = new URL(base); u.searchParams.set('group_id', g.id);
         const rows = await paginate(u, 'audio', x => jsonRequest(x, headers, signal), n => message(g.label + ' : ' + n + ' audios reçus…'));
         for (const a of rows) { const r = normalizeAudio(a, g.label, base); if (!unique.has(r.id)) unique.set(r.id, r); }
         records = Array.from(unique.values());
