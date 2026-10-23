@@ -1,7 +1,7 @@
 /* Shop-Racing Archives audio. No credentials are stored or sent outside this session. */
 (function () {
   'use strict';
-  const VERSION = '1.0.5';
+  const VERSION = '1.0.6';
   const MAX_BYTES = 512 * 1024 * 1024;
   const AUDIO_PATH = /\/ptt\/audio(?:;jsessionid=[^/;]+)?\/?$/i;
   function groupPath(path) {
@@ -18,6 +18,11 @@
     const s = String(name || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase().trim();
     const m = /^(VOITURE|INGENIEUR|MECANICIEN|MECANO)[\s_:#-]*(\d+)\s*$/.exec(s);
     return m ? { role: m[1], license: m[2] } : null;
+  }
+  function dropdownGroup(text) {
+    const match = /^\s*(.*?)\s*\((\d+)\)\s*$/.exec(String(text || ''));
+    const parsed = match && roleLicense(match[1]);
+    return parsed ? { id: match[2], label: parsed.role + ' ' + parsed.license, ...parsed } : null;
   }
   function timestamp(value) {
     if (value == null || value === '') return NaN;
@@ -104,7 +109,7 @@
     throw new Error('Limite de pagination atteinte : chargement incomplet.');
   }
   if (typeof window === 'undefined' && typeof module === 'object' && module.exports) {
-    module.exports = { safeName, roleLicense, timestamp, crc32, makeZip, listEnvelope, paginate, AUDIO_PATH, groupPath }; return;
+    module.exports = { safeName, roleLicense, dropdownGroup, timestamp, crc32, makeZip, listEnvelope, paginate, AUDIO_PATH, groupPath }; return;
   }
   if (window.__shopRacingArchives && typeof window.__shopRacingArchives.restore === 'function') {
     window.__shopRacingArchives.restore(); return;
@@ -115,6 +120,7 @@
   let records = [], busy = false, complete = false, controller;
   let panel, status, queryBox, loadButton, zipButton, tbody, licence, progress, cancelButton;
   let portalHost, restoreObserver, waitingForBody = false;
+  const sessionWaiters = new Set();
   const candidates = new Map();
   function audioRequest(value, observed) {
     try {
@@ -140,6 +146,8 @@
     }
     sessionURL = u; capturedHeaders = { ...(headers || {}) };
     sessionMethod = verb; sessionCredentials = credentials === 'include' ? 'include' : 'same-origin';
+    for (const ready of sessionWaiters) ready(true);
+    sessionWaiters.clear();
     if (queryBox) { queryBox.hidden = true; queryBox.querySelector('input').value = ''; }
     if (status && !busy) status.textContent = 'Session détectée. Saisissez la licence puis chargez les archives.';
   }
@@ -273,6 +281,45 @@
     const node = document.createElement(tag); if (text != null) node.textContent = text;
     if (parent) parent.appendChild(node); return node;
   }
+  function portalRoots() {
+    scanFrames(window);
+    const roots = [], seen = new Set();
+    function visit(root) {
+      if (!root || seen.has(root) || !root.querySelectorAll) return;
+      seen.add(root); roots.push(root);
+      for (const node of root.querySelectorAll('*')) if (node.shadowRoot) visit(node.shadowRoot);
+    }
+    visit(document);
+    for (const scope of accessibleWindows) { try { visit(scope.document); } catch (_) {} }
+    return roots;
+  }
+  function dropdownGroups() {
+    const found = new Map();
+    for (const root of portalRoots()) {
+      for (const node of root.querySelectorAll('.audio-records .el-select input, .audio-records select option, .el-select-dropdown__item, [role="option"]')) {
+        const group = dropdownGroup(node.value || node.textContent);
+        if (group) found.set(group.id, group);
+      }
+    }
+    return found;
+  }
+  async function detectWithNativeQuery() {
+    if (discover()) return true;
+    let button;
+    for (const root of portalRoots()) {
+      button = Array.from(root.querySelectorAll('.audio-records button')).find(b => !b.disabled && /^query$/i.test(String(b.textContent || '').trim()));
+      if (button) break;
+    }
+    if (!button) return false;
+    message('Détection de la session : recherche audio automatique…');
+    return new Promise(resolve => {
+      let timer;
+      const done = success => { clearTimeout(timer); sessionWaiters.delete(done); resolve(success); };
+      sessionWaiters.add(done);
+      timer = setTimeout(() => done(false), 10000);
+      try { button.click(); } catch (_) { done(false); }
+    });
+  }
   function setBusy(value) {
     busy = value; loadButton.disabled = value; zipButton.disabled = value || !complete || !records.length;
     licence.disabled = value; cancelButton.hidden = !value;
@@ -316,7 +363,10 @@
     if (busy) return;
     const number = licence.value.trim();
     if (!/^\d+$/.test(number)) { message('Saisissez un numéro de licence composé de chiffres.'); licence.focus(); return; }
-    discover();
+    if (!sessionURL) {
+      setBusy(true);
+      try { await detectWithNativeQuery(); } finally { setBusy(false); }
+    }
     if (!sessionURL) {
       const raw = queryBox.querySelector('input').value.trim();
       if (!raw) { queryBox.hidden = false; message('Session non détectée : fermez cette fenêtre, ouvrez les enregistrements audio habituels du portail et lancez une recherche. Revenez ensuite ici et cliquez sur Charger les archives. Query reste une solution de secours.'); return; }
@@ -340,6 +390,8 @@
       message('Recherche de tous les groupes…'); progress.removeAttribute('value');
       const groups = await paginate(groupURL, 'group', u => jsonRequest(u, headers, signal), n => message(n + ' groupes examinés…'));
       candidates.clear();
+      // UI hints complement the full API listing; they never prove that every group is loaded.
+      for (const g of dropdownGroups().values()) if (g.license === number) candidates.set(g.id, { id: g.id, label: g.label });
       for (const g of groups) {
         const parsed = roleLicense(g.name ?? g.group_name ?? g.groupName);
         const id = g.id ?? g.group_id ?? g.groupId;
@@ -491,6 +543,10 @@
     ['Date / heure', 'Groupe', 'Utilisateur', 'Lecture', 'Téléchargement'].forEach(t => el('th', t, head)); tbody = el('tbody', null, table);
     launch.onclick = () => {
       if (!panel.open) panel.showModal(); discover();
+      if (!licence.value) {
+        const selected = Array.from(dropdownGroups().values());
+        if (selected.length === 1) licence.value = selected[0].license;
+      }
       if (!busy && !records.length) message(sessionURL ? 'Session détectée. Saisissez votre licence.' : 'Ouvrez une recherche audio dans le portail, puis cliquez sur Charger les archives.');
       licence.focus();
     };
