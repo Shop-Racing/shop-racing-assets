@@ -1,7 +1,7 @@
 /* Shop-Racing Archives audio. No credentials are stored or sent outside this session. */
 (function () {
   'use strict';
-  const VERSION = '1.0.3';
+  const VERSION = '1.0.4';
   const MAX_BYTES = 512 * 1024 * 1024;
   const AUDIO_PATH = /\/ptt\/audio(?:;jsessionid=[^/;]+)?\/?$/i;
   function groupPath(path) {
@@ -103,14 +103,18 @@
     }
     throw new Error('Limite de pagination atteinte : chargement incomplet.');
   }
-  if (typeof module === 'object' && module.exports) {
+  if (typeof window === 'undefined' && typeof module === 'object' && module.exports) {
     module.exports = { safeName, roleLicense, timestamp, crc32, makeZip, listEnvelope, paginate, AUDIO_PATH, groupPath }; return;
   }
-  if (window.__shopRacingArchives) return;
+  if (window.__shopRacingArchives && typeof window.__shopRacingArchives.restore === 'function') {
+    window.__shopRacingArchives.restore(); return;
+  }
+  if (document.getElementById('shop-racing-archives')) return;
   window.__shopRacingArchives = { version: VERSION };
   let sessionURL = null, capturedHeaders = {}, sessionMethod = 'GET', sessionCredentials = 'same-origin';
   let records = [], busy = false, complete = false, controller;
   let panel, status, queryBox, loadButton, zipButton, tbody, licence, progress, cancelButton;
+  let portalHost, restoreObserver, waitingForBody = false;
   const candidates = new Map();
   function audioRequest(value, observed) {
     try {
@@ -139,6 +143,8 @@
     if (queryBox) { queryBox.hidden = true; queryBox.querySelector('input').value = ''; }
     if (status && !busy) status.textContent = 'Session détectée. Saisissez la licence puis chargez les archives.';
   }
+  const nativeFetch = window.fetch ? window.fetch.bind(window) : fetch;
+  function installXHRHook() {
   const originalOpen = XMLHttpRequest.prototype.open;
   const originalSetHeader = XMLHttpRequest.prototype.setRequestHeader;
   const originalSend = XMLHttpRequest.prototype.send;
@@ -161,7 +167,8 @@
     } catch (_) { /* Always preserve the platform's native request. */ }
     return originalSend.apply(this, arguments);
   };
-  const nativeFetch = window.fetch ? window.fetch.bind(window) : fetch;
+  }
+  function installFetchHook() {
   if (window.fetch) window.fetch = function (input, options) {
     // Observe the platform's request; our own requests use nativeFetch and cannot replace the session.
     try {
@@ -181,6 +188,7 @@
     } catch (_) { /* Observation must never break the platform's original request. */ }
     return nativeFetch(input, options);
   };
+  }
   const frameConstructors = new WeakSet(), watchedFrames = new WeakSet(), watchedDocuments = new WeakSet();
   const accessibleWindows = new Set([window]);
   function scanFrames(scope) {
@@ -261,7 +269,6 @@
     }
     return false;
   }
-  discover();
   function el(tag, text, parent) {
     const node = document.createElement(tag); if (text != null) node.textContent = text;
     if (parent) parent.appendChild(node); return node;
@@ -443,10 +450,17 @@
     finally { setBusy(false); }
   }
   function mount() {
-    if (!document.body) { document.addEventListener('DOMContentLoaded', mount, { once: true }); return; }
+    if (!document.body) {
+      if (!waitingForBody) { waitingForBody = true; document.addEventListener('DOMContentLoaded', mount, { once: true }); }
+      return;
+    }
+    if (portalHost) {
+      if (!portalHost.isConnected) document.body.appendChild(portalHost);
+      return;
+    }
     const old = document.getElementById('srbtn'); if (old) old.remove();
-    const host = el('div', null, document.body); host.id = 'shop-racing-archives';
-    host.style.cssText = 'position:fixed;top:20px;right:20px;z-index:2147483647';
+    const host = el('div', null, document.body); portalHost = host; host.id = 'shop-racing-archives';
+    host.style.cssText = 'position:fixed!important;display:block!important;visibility:visible!important;opacity:1!important;top:20px!important;right:20px!important;z-index:2147483647!important';
     const root = host.attachShadow({ mode: 'closed' });
     const style = el('style', null, root);
     style.textContent = ':host{font:14px system-ui,sans-serif;color:#edf0f7}*{box-sizing:border-box}button,input{font:inherit}button{cursor:pointer;border:0;border-radius:9px;padding:11px 16px;background:#f57920;color:#131722;font-weight:700}button:disabled{opacity:.5;cursor:default}button:focus-visible,input:focus-visible{outline:3px solid #8ebaff;outline-offset:3px}dialog{color:#edf0f7;background:#151b28;border:1px solid #414b60;border-radius:18px;width:min(1160px,94vw);max-height:90vh;padding:24px}dialog::backdrop{background:#000a}header,.tools{display:flex;gap:12px;align-items:center;flex-wrap:wrap}header{justify-content:space-between}h2{margin:0;font-size:24px}p{color:#b8c4d8}input{border:1px solid #526078;border-radius:8px;padding:10px;background:#0d121d;color:white;max-width:100%}label{display:flex;gap:8px;align-items:center;flex-wrap:wrap}details{margin:16px 0}details input{width:100%;margin-top:8px}progress{width:100%;height:6px;accent-color:#f57920;margin:12px 0}.table{overflow:auto;max-height:52vh}table{border-collapse:collapse;width:100%;text-align:left}th{background:#202a3d;position:sticky;top:0}th,td{padding:12px;border-bottom:1px solid #303a50;white-space:nowrap}audio{width:260px;height:36px}#status{white-space:pre-wrap;overflow-wrap:anywhere;min-height:40px}#status button{margin-left:12px}small{color:#b8c4d8}';
@@ -478,6 +492,20 @@
       if (!busy && !records.length) message(sessionURL ? 'Session détectée. Saisissez votre licence.' : 'Ouvrez une recherche audio dans le portail, puis cliquez sur Charger les archives.');
       licence.focus();
     };
+    // Keep the same UI and in-memory session when the SPA replaces its page or body.
+    if (typeof MutationObserver !== 'undefined') {
+      restoreObserver = new MutationObserver(() => {
+        if (document.body && !host.isConnected) document.body.appendChild(host);
+      });
+      restoreObserver.observe(document.documentElement || document, { childList: true, subtree: true });
+    }
   }
+  window.__shopRacingArchives.restore = mount;
+  // Display first: a blocked network hook must never prevent access to the portal.
   mount();
+  let hookFailed = false;
+  try { installXHRHook(); } catch (_) { hookFailed = true; }
+  try { installFetchHook(); } catch (_) { hookFailed = true; }
+  try { discover(); } catch (_) { hookFailed = true; }
+  if (hookFailed && status) message('La détection automatique est limitée dans ce navigateur. Lancez une recherche audio habituelle, puis chargez les archives.');
 })();
