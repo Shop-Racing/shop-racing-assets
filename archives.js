@@ -1,7 +1,7 @@
 /* Shop-Racing Archives audio. No credentials are stored or sent outside this session. */
 (function () {
   'use strict';
-  const VERSION = '1.1.0';
+  const VERSION = '1.2.0';
   const MAX_BYTES = 512 * 1024 * 1024;
   const AUDIO_PATH = /\/ptt\/audio(?:;jsessionid=[^/;]+)?\/?$/i;
   function groupPath(path) {
@@ -37,12 +37,32 @@
   function crc32(bytes) {
     let c = 0xffffffff; for (const b of bytes) c = crcTable[(c ^ b) & 255] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0;
   }
+  function wavHeader(bytes, rate) {
+    if (!Number.isInteger(bytes) || bytes < 0 || bytes > MAX_BYTES || bytes % 2) throw new Error('Taille WAV invalide.');
+    const h = new Uint8Array(44), v = new DataView(h.buffer);
+    const put = (offset, text) => Array.from(text).forEach((c, i) => { h[offset + i] = c.charCodeAt(0); });
+    put(0, 'RIFF'); v.setUint32(4, bytes + 36, true); put(8, 'WAVE'); put(12, 'fmt ');
+    v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+    put(36, 'data'); v.setUint32(40, bytes, true); return h;
+  }
+  function monoPCM(buffer) {
+    const channels = Array.from({ length: buffer.numberOfChannels }, (_, c) => buffer.getChannelData(c));
+    const pcm = new Uint8Array(buffer.length * 2), view = new DataView(pcm.buffer);
+    for (let i = 0; i < buffer.length; i++) {
+      let sample = 0; for (const channel of channels) sample += channel[i];
+      sample = Math.max(-1, Math.min(1, sample / channels.length));
+      view.setInt16(i * 2, Math.round(sample * (sample < 0 ? 32768 : 32767)), true);
+    }
+    return pcm;
+  }
   // ZIP32, STORE method, UTF-8 names, CRC32, local headers + central directory + EOCD.
   function makeZip(files) {
     if (!files.length || files.length > 65535) throw new Error('Nombre de fichiers ZIP non pris en charge.');
     const local = [], central = []; let offset = 0, centralSize = 0;
     for (const f of files) {
-      const name = new TextEncoder().encode(safeName(f.name));
+      const extension = /\.[a-z0-9]{1,8}$/i.exec(f.name)?.[0] || '';
+      const name = new TextEncoder().encode(safeName(extension ? f.name.slice(0, -extension.length) : f.name) + extension);
       const bytes = f.bytes;
       if (!(bytes instanceof Uint8Array) || bytes.length > MAX_BYTES || offset + bytes.length > MAX_BYTES)
         throw new Error('Archive trop volumineuse (limite 512 Mo).');
@@ -129,7 +149,7 @@
     throw new Error('Limite de pagination atteinte : recherche incomplète.');
   }
   if (typeof window === 'undefined' && typeof module === 'object' && module.exports) {
-    module.exports = { safeName, roleLicense, dropdownGroup, timestamp, crc32, makeZip, listEnvelope, paginate, portalPages, AUDIO_PATH, groupPath }; return;
+    module.exports = { safeName, roleLicense, dropdownGroup, timestamp, crc32, makeZip, wavHeader, monoPCM, filename, listEnvelope, paginate, portalPages, AUDIO_PATH, groupPath }; return;
   }
   if (window.__shopRacingArchives && typeof window.__shopRacingArchives.restore === 'function') {
     window.__shopRacingArchives.restore(); return;
@@ -138,7 +158,7 @@
   window.__shopRacingArchives = { version: VERSION };
   let sessionURL = null, capturedHeaders = {}, sessionMethod = 'GET', sessionCredentials = 'same-origin';
   let records = [], busy = false, complete = false, controller;
-  let panel, status, queryBox, loadButton, zipButton, tbody, licence, progress, cancelButton;
+  let panel, status, queryBox, loadButton, zipButton, mergeButton, tbody, licence, progress, cancelButton;
   let portalHost, restoreObserver, waitingForBody = false;
   let licenceList, suggestionsTask = null;
   const sessionWaiters = new Set();
@@ -329,16 +349,23 @@
     let button;
     for (const root of portalRoots()) {
       button = Array.from(root.querySelectorAll('.audio-records button')).find(b => !b.disabled && /^query$/i.test(String(b.textContent || '').trim()));
+      if (!button) button = Array.from(root.querySelectorAll('button, [role="button"]')).find(b =>
+        !b.disabled && /^query$/i.test(String(b.textContent || '').trim()) && (!b.getClientRects || b.getClientRects().length));
       if (button) break;
     }
     if (!button) return false;
     message('Détection de la session : recherche audio automatique…');
     return new Promise(resolve => {
       let timer;
-      const done = success => { clearTimeout(timer); sessionWaiters.delete(done); resolve(success); };
+      const wasOpen = panel && panel.open;
+      const done = success => {
+        clearTimeout(timer); sessionWaiters.delete(done);
+        if (wasOpen && !panel.open) panel.showModal();
+        resolve(success);
+      };
       sessionWaiters.add(done);
       timer = setTimeout(() => done(false), 10000);
-      try { button.click(); } catch (_) { done(false); }
+      try { if (wasOpen) panel.close(); button.click(); } catch (_) { done(false); }
     });
   }
   function offerLicences(groups) {
@@ -373,6 +400,7 @@
   }
   function setBusy(value) {
     busy = value; loadButton.disabled = value; zipButton.disabled = value || !complete || !records.length;
+    mergeButton.disabled = value || !complete || !records.length;
     licence.disabled = value; cancelButton.hidden = !value;
   }
   function message(text) { status.textContent = text; }
@@ -473,13 +501,14 @@
   }
   function filename(r, index, type) {
     const ext = /mpeg|mp3/i.test(type) ? 'mp3' : /wav/i.test(type) ? 'wav' : /ogg/i.test(type) ? 'ogg' : /mp4|m4a/i.test(type) ? 'm4a' : /aac/i.test(type) ? 'aac' : /webm/i.test(type) ? 'webm' : 'audio';
-    const date = Number.isFinite(r.time) ? new Date(r.time).toISOString().replace(/[:.]/g, '-') : 'date-inconnue';
+    const t = new Date(r.time), pad = n => String(n).padStart(2, '0');
+    const date = Number.isFinite(r.time) ? t.getFullYear() + '-' + pad(t.getMonth() + 1) + '-' + pad(t.getDate()) + '_' + pad(t.getHours()) + 'h' + pad(t.getMinutes()) + 'm' + pad(t.getSeconds()) + 's' : 'date-inconnue';
     // Use only neutral labels in exported filenames, never hostnames or remote basenames.
-    return safeName(String(index + 1).padStart(5, '0') + '_' + date + '_' + r.group) + '.' + ext;
+    return safeName(String(index + 1).padStart(5, '0') + '_' + date + '_' + r.group + '_' + r.user) + '.' + ext;
   }
-  async function audioBytes(r, signal, remaining) {
+  async function audioBytes(r, signal, remaining, forPlayback) {
     if (!r.downloadURL && !r.url) throw new Error('Lien audio indisponible.');
-    const u = new URL(r.downloadURL || r.url), same = u.origin === location.origin;
+    const u = new URL(forPlayback ? (r.url || r.downloadURL) : (r.downloadURL || r.url)), same = u.origin === location.origin;
     const response = await fetch(u, { mode: 'cors', credentials: same ? 'same-origin' : 'omit', signal, redirect: 'error' });
     if (!response.ok || response.type === 'opaque') throw new Error('Audio inaccessible.');
     const type = response.headers.get('content-type') || '';
@@ -523,6 +552,43 @@
         finally { save.disabled = false; setBusy(false); }
       };
     }); tbody.appendChild(fragment);
+  }
+  async function exportMerged() {
+    if (busy || !complete || !records.length) return;
+    const Audio = window.AudioContext || window.webkitAudioContext;
+    if (!Audio) { message('La fusion audio n’est pas prise en charge par ce navigateur.'); return; }
+    setBusy(true); controller = new AbortController(); const signal = controller.signal;
+    let context;
+    try {
+      context = new Audio({ sampleRate: 24000 });
+      if (context.resume) await context.resume();
+      const chunks = []; let size = 0, failures = 0;
+      progress.max = records.length; progress.value = 0;
+      for (let i = 0; i < records.length; i++) {
+        if (signal.aborted) throw new DOMException('Cancelled', 'AbortError');
+        message('Fusion audio : ' + (i + 1) + '/' + records.length + '…');
+        try {
+          const file = await audioBytes(records[i], signal, MAX_BYTES, true);
+          const decoded = await context.decodeAudioData(file.bytes.buffer);
+          if (decoded.length * 2 + size > MAX_BYTES) throw new RangeError('Fusion limitée à 512 Mo. Exportez une période plus courte.');
+          if (signal.aborted) throw new DOMException('Cancelled', 'AbortError');
+          const pcm = monoPCM(decoded); chunks.push(pcm); size += pcm.length;
+        } catch (e) { if (signal.aborted || e instanceof RangeError) throw e; failures++; }
+        progress.value = i + 1;
+      }
+      if (!chunks.length) { message('Aucun audio décodable : accès CORS ou format non pris en charge. Aucun fichier créé.'); return; }
+      const blob = new Blob([wavHeader(size, context.sampleRate), ...chunks], { type: 'audio/wav' });
+      const name = 'Shop-Racing_Licence-' + safeName(licence.value) + '_Echanges-chronologiques' + (failures ? '_PARTIEL' : '') + '.wav';
+      message('Audio unique prêt : ' + chunks.length + '/' + records.length + ' enregistrements, à la suite sans les temps de silence entre échanges.' + (failures ? ' ' + failures + ' échecs : fichier partiel.' : ''));
+      const save = el('button', 'Télécharger l’audio unique', status), url = URL.createObjectURL(blob);
+      save.onclick = () => {
+        const a = el('a', null, document.body); a.href = url; a.download = name; a.click(); a.remove(); save.disabled = true;
+        message('Téléchargement de l’audio unique demandé au navigateur. Vérifiez vos téléchargements.');
+        setTimeout(() => URL.revokeObjectURL(url), 60000);
+      };
+      setTimeout(() => { URL.revokeObjectURL(url); if (save.isConnected) { save.disabled = true; save.textContent = 'Fichier expiré — relancez la fusion'; } }, 600000);
+    } catch (e) { message(signal.aborted ? 'Fusion annulée.' : (e instanceof RangeError ? e.message : 'Fusion impossible. Aucun téléchargement demandé.')); }
+    finally { if (context) await context.close().catch(() => {}); setBusy(false); }
   }
   async function exportZip() {
     if (busy || !complete || !records.length) return;
@@ -587,6 +653,7 @@
     licenceList = el('datalist', null, panel); licenceList.id = 'sr-licences';
     loadButton = el('button', 'Charger les archives', tools); loadButton.onclick = load;
     zipButton = el('button', 'Exporter tous les audios en ZIP', tools); zipButton.disabled = true; zipButton.onclick = exportZip;
+    mergeButton = el('button', 'Créer un audio unique (WAV)', tools); mergeButton.disabled = true; mergeButton.onclick = exportMerged;
     cancelButton = el('button', 'Annuler', tools); cancelButton.hidden = true; cancelButton.onclick = () => controller && controller.abort();
     queryBox = el('details', null, panel); queryBox.hidden = true; queryBox.open = true;
     el('summary', 'Query de session — solution de secours', queryBox);
