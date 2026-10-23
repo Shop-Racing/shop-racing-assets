@@ -1,7 +1,7 @@
 /* Shop-Racing Archives audio. No credentials are stored or sent outside this session. */
 (function () {
   'use strict';
-  const VERSION = '1.0.6';
+  const VERSION = '1.0.7';
   const MAX_BYTES = 512 * 1024 * 1024;
   const AUDIO_PATH = /\/ptt\/audio(?:;jsessionid=[^/;]+)?\/?$/i;
   function groupPath(path) {
@@ -120,6 +120,7 @@
   let records = [], busy = false, complete = false, controller;
   let panel, status, queryBox, loadButton, zipButton, tbody, licence, progress, cancelButton;
   let portalHost, restoreObserver, waitingForBody = false;
+  let licenceList, suggestionsTask = null;
   const sessionWaiters = new Set();
   const candidates = new Map();
   function audioRequest(value, observed) {
@@ -319,6 +320,36 @@
       timer = setTimeout(() => done(false), 10000);
       try { button.click(); } catch (_) { done(false); }
     });
+  }
+  function offerLicences(groups) {
+    const numbers = new Set();
+    for (const group of groups) {
+      const parsed = group.license ? group : roleLicense(group.name ?? group.group_name ?? group.groupName);
+      if (parsed) numbers.add(parsed.license);
+    }
+    const sorted = Array.from(numbers).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+    licenceList.replaceChildren();
+    for (const number of sorted) { const option = el('option', number, licenceList); option.value = number; }
+  }
+  function suggestLicences() {
+    if (suggestionsTask || busy) return;
+    const hints = Array.from(dropdownGroups().values()); offerLicences(hints);
+    loadButton.disabled = true;
+    suggestionsTask = (async () => {
+      try {
+        if (!sessionURL && !await detectWithNativeQuery()) return;
+        const u = new URL(sessionURL); u.pathname = groupPath(u.pathname);
+        u.searchParams.set('method', 'get'); u.searchParams.set('group_id', '');
+        for (const key of ['audio_id', 'user_id', 'start_time', 'end_time', 'begin_time', 'start_date', 'end_date', 'date', 'keyword']) u.searchParams.delete(key);
+        const signal = new AbortController().signal;
+        message('Recherche des licences disponibles…');
+        const groups = await paginate(u, 'group', url => jsonRequest(url, { ...capturedHeaders }, signal));
+        offerLicences([...hints, ...groups]);
+        message('Choisissez une licence dans la liste ou saisissez son numéro.');
+      } catch (_) {
+        message('Liste de licences partielle ou indisponible. Vous pouvez saisir le numéro au clavier.');
+      } finally { suggestionsTask = null; loadButton.disabled = busy; }
+    })();
   }
   function setBusy(value) {
     busy = value; loadButton.disabled = value; zipButton.disabled = value || !complete || !records.length;
@@ -528,6 +559,8 @@
     el('small', 'Version ' + VERSION, panel);
     const tools = el('div', null, panel); tools.className = 'tools';
     const label = el('label', 'Licence', tools); licence = el('input', null, label); licence.inputMode = 'numeric'; licence.placeholder = 'Numéro de licence';
+    licence.setAttribute('list', 'sr-licences'); licence.setAttribute('autocomplete', 'off');
+    licenceList = el('datalist', null, panel); licenceList.id = 'sr-licences';
     loadButton = el('button', 'Charger les archives', tools); loadButton.onclick = load;
     zipButton = el('button', 'Exporter tous les audios en ZIP', tools); zipButton.disabled = true; zipButton.onclick = exportZip;
     cancelButton = el('button', 'Annuler', tools); cancelButton.hidden = true; cancelButton.onclick = () => controller && controller.abort();
@@ -549,6 +582,7 @@
       }
       if (!busy && !records.length) message(sessionURL ? 'Session détectée. Saisissez votre licence.' : 'Ouvrez une recherche audio dans le portail, puis cliquez sur Charger les archives.');
       licence.focus();
+      suggestLicences();
     };
     // Keep the same UI and in-memory session when the SPA replaces its page or body.
     if (typeof MutationObserver !== 'undefined') {
