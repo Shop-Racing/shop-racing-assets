@@ -1,8 +1,13 @@
 /* Shop-Racing Archives audio. No credentials are stored or sent outside this session. */
 (function () {
   'use strict';
-  const VERSION = '1.0.2';
+  const VERSION = '1.0.3';
   const MAX_BYTES = 512 * 1024 * 1024;
+  const AUDIO_PATH = /\/ptt\/audio(?:;jsessionid=[^/;]+)?\/?$/i;
+  function groupPath(path) {
+    if (!AUDIO_PATH.test(path)) throw new Error('Adresse audio non reconnue.');
+    return path.replace(/(\/ptt\/)audio((?:;jsessionid=[^/;]+)?\/?)$/i, '$1group$2');
+  }
   function safeName(value) {
     let s = String(value || 'audio').normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
       .replace(/[^a-zA-Z0-9._-]+/g, '_').replace(/^\.+|[. ]+$/g, '').slice(0, 100);
@@ -99,7 +104,7 @@
     throw new Error('Limite de pagination atteinte : chargement incomplet.');
   }
   if (typeof module === 'object' && module.exports) {
-    module.exports = { safeName, roleLicense, timestamp, crc32, makeZip, listEnvelope, paginate }; return;
+    module.exports = { safeName, roleLicense, timestamp, crc32, makeZip, listEnvelope, paginate, AUDIO_PATH, groupPath }; return;
   }
   if (window.__shopRacingArchives) return;
   window.__shopRacingArchives = { version: VERSION };
@@ -111,7 +116,7 @@
     try {
       const u = new URL(String(value), location.href);
       return (observed || u.origin === location.origin) && /^https?:$/.test(u.protocol) &&
-        !u.username && !u.password && /\/ptt\/audio\/?$/.test(u.pathname) ? u : null;
+        !u.username && !u.password && AUDIO_PATH.test(u.pathname) ? u : null;
     } catch (_) { return null; }
   }
   function capture(value, headers, method, body, credentials, observed) {
@@ -279,7 +284,7 @@
       opts.body = url.searchParams.toString();
     }
     const r = await nativeFetch(url, opts);
-    if (!r.ok) throw new Error(r.status === 401 || r.status === 403 ? 'Session expirée ou accès refusé.' : 'Erreur serveur pendant le chargement.');
+    if (!r.ok) throw new Error(r.status === 401 || r.status === 403 ? 'Session expirée ou accès refusé.' : r.status === 503 ? 'Serveur temporairement indisponible (503). Réessayez lorsque la recherche audio habituelle fonctionne.' : 'Erreur serveur pendant le chargement (HTTP ' + r.status + ').');
     try { return await r.json(); } catch (_) { throw new Error('Réponse serveur non JSON. Rouvrez les archives natives.'); }
     } catch (e) {
       if (expired) throw new Error('Le serveur ne répond pas depuis 30 secondes. Réessayez après une recherche audio habituelle.');
@@ -319,7 +324,7 @@
     const base = new URL(sessionURL), headers = { ...capturedHeaders };
     // Empty group_id reuses the authenticated session without narrowing the group discovery.
     base.searchParams.set('group_id', '');
-    const groupURL = new URL(base); groupURL.pathname = groupURL.pathname.replace(/audio\/?$/, 'group');
+    const groupURL = new URL(base); groupURL.pathname = groupPath(groupURL.pathname);
     groupURL.searchParams.set('method', 'get');
     for (const key of ['audio_id', 'user_id', 'start_time', 'end_time', 'begin_time', 'start_date', 'end_date', 'date', 'keyword']) {
       groupURL.searchParams.delete(key); base.searchParams.delete(key);
