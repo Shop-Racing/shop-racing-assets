@@ -1,7 +1,7 @@
 /* Shop-Racing Archives audio. No credentials are stored or sent outside this session. */
 (function () {
   'use strict';
-  const VERSION = '1.3.3';
+  const VERSION = '1.4.0';
   const MAX_BYTES = 512 * 1024 * 1024;
   const AUDIO_PATH = /\/ptt\/audio(?:;jsessionid=[^/;]+)?\/?$/i;
   function groupPath(path) {
@@ -179,7 +179,7 @@
   let records = [], busy = false, complete = false, controller;
   let panel, status, queryBox, loadButton, dateInput, zipButton, mergeButton, tbody, licence, progress, cancelButton;
   let portalHost, restoreObserver, waitingForBody = false;
-  let licenceList, suggestionsTask = null;
+  let licenceList, licenceToggle, licenceNumbers = [], suggestionsTask = null;
   const sessionWaiters = new Set();
   let nativeQueryIssue = '';
   let nativeAudioResult = null;
@@ -492,17 +492,85 @@
       const parsed = group.license ? group : roleLicense(group.name ?? group.group_name ?? group.groupName);
       if (parsed) numbers.add(parsed.license);
     }
-    const sorted = Array.from(numbers).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+    licenceNumbers = Array.from(numbers).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+    renderLicenceMenu(false);
+  }
+  function renderLicenceMenu(filter) {
     licenceList.replaceChildren();
-    for (const number of sorted) { const option = el('option', number, licenceList); option.value = number; }
+    const matches = licenceNumbers.filter(n => !filter || n.includes(licence.value.trim()));
+    for (const number of matches) {
+      const item = el('li', null, licenceList), option = el('button', number, item);
+      option.type = 'button'; option.value = number; option.setAttribute('role', 'option');
+      option.setAttribute('aria-selected', String(licence.value === number));
+      if (licence.value === number) option.className = 'selected';
+      option.onmousedown = event => event.preventDefault();
+      option.onclick = () => { licence.value = number; showLicenceMenu(false); licence.focus(); };
+    }
+    if (!matches.length) el('li', licenceNumbers.length ? 'Aucune licence correspondante' : 'Chargement des licences…', licenceList).className = 'licence-empty';
+  }
+  function showLicenceMenu(open, filter) {
+    if (open) renderLicenceMenu(!!filter);
+    licenceList.hidden = !open; licence.setAttribute('aria-expanded', String(open));
+    licenceToggle.setAttribute('aria-expanded', String(open));
+  }
+  async function ensureAudioPage() {
+    const findTab = () => {
+      for (const root of portalRoots()) {
+        const tab = Array.from(root.querySelectorAll('.data-center-tabs a, .data-center-tabs button')).find(n => /^audio\s*records$/i.test(String(n.textContent || '').trim()));
+        if (tab) return tab;
+      }
+      return null;
+    };
+    const existing = findTab();
+    if (existing) {
+      const reopen = panel?.open; if (reopen) panel.close();
+      try { if (!existing.classList?.contains('is-active')) existing.click(); await Promise.resolve(); }
+      finally { if (reopen && !panel.open) panel.showModal(); }
+      return;
+    }
+    if (pageDateInput()) return;
+    const wasOpen = panel?.open; if (wasOpen) panel.close();
+    try {
+      let navigated = false;
+      for (const root of portalRoots()) {
+        for (const node of root.querySelectorAll('#app, .site-wrapper')) {
+          let vm = node.__vue__;
+          for (let i = 0; vm && i < 5; vm = vm.$parent, i++) {
+            if (vm.$router?.push) {
+              await Promise.resolve(vm.$router.push('/data-center/recorder')).catch(() => {});
+              navigated = true; break;
+            }
+          }
+          if (navigated) break;
+        }
+        if (navigated) break;
+        const link = Array.from(root.querySelectorAll('a, button')).find(n => /^data\s*center$/i.test(String(n.textContent || '').trim()));
+        if (link) { link.click(); navigated = true; break; }
+      }
+      if (!navigated) return;
+      message('Ouverture des enregistrements audio…');
+      for (let i = 0; i < 60; i++) {
+        const tab = findTab();
+        if (tab) { if (!tab.classList?.contains('is-active')) tab.click(); await Promise.resolve(); return; }
+        if (pageDateInput()) return;
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      throw new Error('La page Audio Records ne s’est pas ouverte. Réessayez après la connexion.');
+    } finally { if (wasOpen && !panel.open) panel.showModal(); }
   }
   function suggestLicences() {
     if (suggestionsTask || busy) return;
-    const hints = Array.from(dropdownGroups().values()); offerLicences(hints);
+    let hints = Array.from(dropdownGroups().values()); offerLicences(hints);
     loadButton.disabled = true;
     suggestionsTask = (async () => {
       try {
-        if (!sessionURL && !await detectWithNativeQuery()) return;
+        await ensureAudioPage();
+        hints = Array.from(dropdownGroups().values()); offerLicences(hints);
+        if (!dateInput.value) {
+          const initial = searchDate(pageDateInput()?.value) || searchDate(sessionURL?.searchParams.get('start_time'));
+          if (initial) dateInput.value = initial.replace(' ', 'T');
+        }
+        if (!sessionURL && !await detectWithNativeQuery(false, searchDate(dateInput.value), licence.value || hints[0]?.license)) return;
         const u = new URL(sessionURL); u.pathname = groupPath(u.pathname);
         u.searchParams.set('method', 'get'); u.searchParams.set('group_id', '');
         for (const key of ['group_id', 'group_name', 'order_type', 'codec_type', 'time', 'audio_id', 'user_id', 'start_time', 'end_time', 'begin_time', 'start_date', 'end_date', 'date', 'keyword']) u.searchParams.delete(key);
@@ -520,7 +588,7 @@
     busy = value; loadButton.disabled = value; zipButton.disabled = value || !complete || !records.length;
     dateInput.disabled = value;
     mergeButton.disabled = value || !complete || !records.length;
-    licence.disabled = value; cancelButton.hidden = !value;
+    licence.disabled = value; licenceToggle.disabled = value; if (value) showLicenceMenu(false); cancelButton.hidden = !value;
   }
   function message(text) { status.textContent = text; }
   async function jsonRequest(url, headers, signal) {
@@ -779,6 +847,7 @@
     const style = el('style', null, root);
     style.textContent = ':host{font:14px system-ui,sans-serif;color:#edf0f7}*{box-sizing:border-box}button,input{font:inherit}button{cursor:pointer;border:0;border-radius:9px;padding:11px 16px;background:#f57920;color:#131722;font-weight:700}button:disabled{opacity:.5;cursor:default}button:focus-visible,input:focus-visible{outline:3px solid #8ebaff;outline-offset:3px}dialog{color:#edf0f7;background:#151b28;border:1px solid #414b60;border-radius:18px;width:min(1160px,94vw);max-height:90vh;padding:24px}dialog::backdrop{background:#000a}header,.tools{display:flex;gap:12px;align-items:center;flex-wrap:wrap}header{justify-content:space-between}h2{margin:0;font-size:24px}p{color:#b8c4d8}input{border:1px solid #526078;border-radius:8px;padding:10px;background:#0d121d;color:white;max-width:100%}label{display:flex;gap:8px;align-items:center;flex-wrap:wrap}details{margin:16px 0}details input{width:100%;margin-top:8px}progress{width:100%;height:6px;accent-color:#f57920;margin:12px 0}.table{overflow:auto;max-height:52vh}table{border-collapse:collapse;width:100%;text-align:left}th{background:#202a3d;position:sticky;top:0}th,td{padding:12px;border-bottom:1px solid #303a50;white-space:nowrap}audio{width:260px;height:36px}#status{white-space:pre-wrap;overflow-wrap:anywhere;min-height:40px}#status button{margin-left:12px}small{color:#b8c4d8}';
     const launch = el('button', 'ARCHIVES AUDIO', root); launch.setAttribute('aria-haspopup', 'dialog');
+    el('style', '.licence-combo{position:relative;display:flex;width:215px;border:1px solid #465267;border-radius:4px;background:#242a38}.licence-combo:focus-within{border-color:#409eff}.licence-combo input{width:175px;border:0;background:transparent;border-radius:4px;padding:10px 12px}.licence-combo .licence-toggle{width:38px;padding:0;background:transparent;color:#b5bfce;border-radius:0;font-size:17px}.licence-menu{position:absolute;top:calc(100% + 7px);left:0;right:0;z-index:20;margin:0;padding:6px 0;list-style:none;background:#242a38;border:1px solid #465267;border-radius:4px;box-shadow:0 6px 18px #0005;max-height:240px;overflow:auto}.licence-menu[hidden]{display:none}.licence-menu button{width:100%;border-radius:0;padding:10px 16px;text-align:left;background:transparent;color:#edf0f7;font-weight:400}.licence-menu button:hover,.licence-menu button:focus{background:#303b4e}.licence-menu button.selected{color:#409eff;font-weight:700;background:#203b58}.licence-empty{padding:12px;color:#aeb9cc;font-size:12px}', root);
     panel = el('dialog', null, root); panel.setAttribute('aria-label', 'Shop-Racing Archives audio');
     const header = el('header', null, panel); el('h2', 'Shop-Racing · Archives audio', header);
     const close = el('button', 'Fermer', header);
@@ -787,9 +856,23 @@
     el('p', 'Retrouvez les échanges de votre licence sur la période de la recherche habituelle, du plus ancien au plus récent.', panel);
     el('small', 'Version ' + VERSION, panel);
     const tools = el('div', null, panel); tools.className = 'tools';
-    const label = el('label', 'Licence', tools); licence = el('input', null, label); licence.inputMode = 'numeric'; licence.placeholder = 'Numéro de licence';
-    licence.setAttribute('list', 'sr-licences'); licence.setAttribute('autocomplete', 'off');
-    licenceList = el('datalist', null, panel); licenceList.id = 'sr-licences';
+    const label = el('label', 'Licence', tools), combo = el('div', null, label); combo.className = 'licence-combo';
+    licence = el('input', null, combo); licence.inputMode = 'numeric'; licence.placeholder = 'Choisir une licence';
+    licence.setAttribute('autocomplete', 'off'); licence.setAttribute('role', 'combobox'); licence.setAttribute('aria-controls', 'sr-licences'); licence.setAttribute('aria-expanded', 'false');
+    licenceToggle = el('button', '⌄', combo); licenceToggle.type = 'button'; licenceToggle.className = 'licence-toggle'; licenceToggle.setAttribute('aria-label', 'Afficher les licences');
+    licenceList = el('ul', null, combo); licenceList.id = 'sr-licences'; licenceList.className = 'licence-menu'; licenceList.hidden = true; licenceList.setAttribute('role', 'listbox');
+    licenceToggle.onclick = () => showLicenceMenu(licenceList.hidden);
+    licence.onclick = () => showLicenceMenu(true);
+    licence.oninput = () => showLicenceMenu(true, true);
+    licence.onkeydown = event => {
+      if (event.key === 'Escape') { showLicenceMenu(false); return; }
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault(); showLicenceMenu(true, true);
+        const options = licenceList.querySelectorAll('button');
+        (event.key === 'ArrowDown' ? options[0] : options[options.length - 1])?.focus();
+      }
+    };
+    combo.addEventListener('focusout', event => { if (!combo.contains(event.relatedTarget)) showLicenceMenu(false); });
     const dateLabel = el('label', 'Date et heure de début', tools); dateInput = el('input', null, dateLabel);
     dateInput.type = 'datetime-local'; dateInput.step = '1'; dateInput.required = true;
     loadButton = el('button', 'Charger les archives', tools); loadButton.onclick = load;
