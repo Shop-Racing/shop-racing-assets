@@ -1,7 +1,7 @@
 /* Shop-Racing Archives audio. No credentials are stored or sent outside this session. */
 (function () {
   'use strict';
-  const VERSION = '1.3.0';
+  const VERSION = '1.3.1';
   const MAX_BYTES = 512 * 1024 * 1024;
   const AUDIO_PATH = /\/ptt\/audio(?:;jsessionid=[^/;]+)?\/?$/i;
   function groupPath(path) {
@@ -176,6 +176,7 @@
   let portalHost, restoreObserver, waitingForBody = false;
   let licenceList, suggestionsTask = null;
   const sessionWaiters = new Set();
+  let nativeQueryIssue = '';
   const candidates = new Map();
   function audioRequest(value, observed) {
     try {
@@ -374,7 +375,44 @@
     input.dispatchEvent(new scope.KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
     input.dispatchEvent(new scope.Event('blur', { bubbles: true }));
   }
-  async function detectWithNativeQuery(force, date) {
+  async function syncPageGroup(number) {
+    if (!number) return true;
+    const roots = portalRoots();
+    let select;
+    for (const root of roots) {
+      select = root.querySelectorAll('.audio-records .filter-box .el-select')[0];
+      if (select) break;
+    }
+    if (!select) return false;
+    const current = select.querySelector('input');
+    const parsed = dropdownGroup(current?.value);
+    if (parsed?.license === number) return true;
+    const choose = () => {
+      const options = [];
+      // Element UI may place the menu inside the select or append it to the document.
+      for (const root of roots) for (const node of root.querySelectorAll('.el-select-dropdown__item')) {
+        const group = dropdownGroup(node.textContent) || roleLicense(node.textContent);
+        if (group?.license === number && !node.classList?.contains('is-disabled')) options.push({ node, group });
+      }
+      const rank = role => ['VOITURE', 'INGENIEUR', 'MECANO', 'MECANICIEN'].indexOf(role);
+      options.sort((a, b) => rank(a.group.role) - rank(b.group.role));
+      if (!options.length) return false;
+      options[0].node.click(); return true;
+    };
+    select.click();
+    // Let the portal render its menu and apply the real option's own selection handler.
+    await Promise.resolve();
+    if (!choose()) {
+      await new Promise(resolve => setTimeout(resolve, 200));
+      if (!choose()) { select.click(); throw new Error('Aucun groupe de la licence ' + number + ' dans Select Group. Ouvrez cette liste dans la page et vérifiez la licence.'); }
+    }
+    await Promise.resolve();
+    const selected = dropdownGroup(current?.value);
+    if (selected?.license !== number) throw new Error('La sélection du groupe n’a pas été confirmée. Choisissez un groupe de la licence ' + number + ' dans Select Group puis réessayez.');
+    return true;
+  }
+  async function detectWithNativeQuery(force, date, number) {
+    nativeQueryIssue = '';
     if (!force && discover()) return true;
     let button;
     for (const root of portalRoots()) {
@@ -396,7 +434,11 @@
       };
       sessionWaiters.add(done);
       timer = setTimeout(() => done(false), 10000);
-      try { if (wasOpen) panel.close(); syncPageDate(date); button.click(); } catch (_) { done(false); }
+      Promise.resolve().then(async () => {
+        if (wasOpen) panel.close();
+        await syncPageGroup(number);
+        syncPageDate(date); button.click();
+      }).catch(e => { nativeQueryIssue = e.message || 'Sélection du groupe impossible.'; done(false); });
     });
   }
   function offerLicences(groups) {
@@ -479,8 +521,9 @@
     if (!chosenDate) { message('Choisissez une date et une heure valides pour la recherche.'); dateInput.focus(); return; }
     {
       setBusy(true);
-      try { await detectWithNativeQuery(true, chosenDate); } finally { setBusy(false); }
+      try { await detectWithNativeQuery(true, chosenDate, number); } finally { setBusy(false); }
     }
+    if (nativeQueryIssue) { message(nativeQueryIssue); return; }
     if (!sessionURL) {
       const raw = queryBox.querySelector('input').value.trim();
       if (!raw) { queryBox.hidden = false; message('Session non détectée : fermez cette fenêtre, ouvrez les enregistrements audio habituels du portail et lancez une recherche. Revenez ensuite ici et cliquez sur Charger les archives. Query reste une solution de secours.'); return; }
