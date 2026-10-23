@@ -1,7 +1,7 @@
 /* Shop-Racing Archives audio. No credentials are stored or sent outside this session. */
 (function () {
   'use strict';
-  const VERSION = '1.3.1';
+  const VERSION = '1.3.2';
   const MAX_BYTES = 512 * 1024 * 1024;
   const AUDIO_PATH = /\/ptt\/audio(?:;jsessionid=[^/;]+)?\/?$/i;
   function groupPath(path) {
@@ -366,13 +366,36 @@
     }
     return null;
   }
-  function syncPageDate(value) {
+  async function syncPageDate(value) {
     const input = pageDateInput(); if (!input || !value) return;
+    // Element UI keeps a separate calendar model. Commit through its own pick handler.
+    let component;
+    for (let node = input, depth = 0; node && depth < 5 && !component; node = node.parentElement, depth++) {
+      let vm = node.__vue__;
+      for (let i = 0; vm && i < 5; vm = vm.$parent, i++) {
+        if (vm.type === 'datetime' && typeof vm.parseString === 'function' && typeof vm.emitInput === 'function') { component = vm; break; }
+      }
+    }
+    if (component) {
+      if (!component.picker && component.mountPicker) component.mountPicker();
+      const date = component.parseString(value);
+      if (!date || (component.isValidValue && !component.isValidValue(date)) || !component.picker?.$emit)
+        throw new Error('Date refusée par le calendrier de la page. Choisissez une autre date.');
+      component.picker.$emit('pick', date, false);
+      if (component.$nextTick) await component.$nextTick();
+      component.emitChange?.(component.value);
+      if (component.$nextTick) await component.$nextTick();
+      const confirmed = component.parsedValue;
+      if (!confirmed || typeof confirmed.getTime !== 'function' || confirmed.getTime() !== date.getTime())
+        throw new Error('La date n’a pas été confirmée par le calendrier. Query n’a pas été lancé.');
+      return;
+    }
     const scope = input.ownerDocument.defaultView;
     const setter = Object.getOwnPropertyDescriptor(scope.HTMLInputElement.prototype, 'value').set;
     setter.call(input, value);
     for (const event of ['input', 'change']) input.dispatchEvent(new scope.Event(event, { bubbles: true }));
-    input.dispatchEvent(new scope.KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
+    await Promise.resolve();
+    input.dispatchEvent(new scope.KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
     input.dispatchEvent(new scope.Event('blur', { bubbles: true }));
   }
   async function syncPageGroup(number) {
@@ -437,7 +460,7 @@
       Promise.resolve().then(async () => {
         if (wasOpen) panel.close();
         await syncPageGroup(number);
-        syncPageDate(date); button.click();
+        await syncPageDate(date); button.click();
       }).catch(e => { nativeQueryIssue = e.message || 'Sélection du groupe impossible.'; done(false); });
     });
   }
