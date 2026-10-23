@@ -1,7 +1,7 @@
 /* Shop-Racing Archives audio. No credentials are stored or sent outside this session. */
 (function () {
   'use strict';
-  const VERSION = '1.4.0';
+  const VERSION = '1.4.1';
   const MAX_BYTES = 512 * 1024 * 1024;
   const AUDIO_PATH = /\/ptt\/audio(?:;jsessionid=[^/;]+)?\/?$/i;
   function groupPath(path) {
@@ -842,11 +842,35 @@
     }
     const old = document.getElementById('srbtn'); if (old) old.remove();
     const host = el('div', null, document.body); portalHost = host; host.id = 'shop-racing-archives';
-    host.style.cssText = 'position:fixed!important;display:block!important;visibility:visible!important;opacity:1!important;top:20px!important;right:20px!important;z-index:2147483647!important';
+    host.style.cssText = 'position:fixed!important;display:block!important;visibility:visible!important;opacity:1!important;bottom:16px!important;left:16px!important;z-index:2147483647!important';
     const root = host.attachShadow({ mode: 'closed' });
     const style = el('style', null, root);
     style.textContent = ':host{font:14px system-ui,sans-serif;color:#edf0f7}*{box-sizing:border-box}button,input{font:inherit}button{cursor:pointer;border:0;border-radius:9px;padding:11px 16px;background:#f57920;color:#131722;font-weight:700}button:disabled{opacity:.5;cursor:default}button:focus-visible,input:focus-visible{outline:3px solid #8ebaff;outline-offset:3px}dialog{color:#edf0f7;background:#151b28;border:1px solid #414b60;border-radius:18px;width:min(1160px,94vw);max-height:90vh;padding:24px}dialog::backdrop{background:#000a}header,.tools{display:flex;gap:12px;align-items:center;flex-wrap:wrap}header{justify-content:space-between}h2{margin:0;font-size:24px}p{color:#b8c4d8}input{border:1px solid #526078;border-radius:8px;padding:10px;background:#0d121d;color:white;max-width:100%}label{display:flex;gap:8px;align-items:center;flex-wrap:wrap}details{margin:16px 0}details input{width:100%;margin-top:8px}progress{width:100%;height:6px;accent-color:#f57920;margin:12px 0}.table{overflow:auto;max-height:52vh}table{border-collapse:collapse;width:100%;text-align:left}th{background:#202a3d;position:sticky;top:0}th,td{padding:12px;border-bottom:1px solid #303a50;white-space:nowrap}audio{width:260px;height:36px}#status{white-space:pre-wrap;overflow-wrap:anywhere;min-height:40px}#status button{margin-left:12px}small{color:#b8c4d8}';
     const launch = el('button', 'ARCHIVES AUDIO', root); launch.setAttribute('aria-haspopup', 'dialog');
+    const placeLaunch = () => {
+      let position = 'bottom:16px!important;left:16px!important;top:auto!important;right:auto!important;';
+      if (document.querySelectorAll) for (const node of document.querySelectorAll('a,button,li,[role="menuitem"],div,span')) {
+        if (!/^(settings|paramètres|parametres)$/i.test(String(node.textContent || '').trim()) || !node.getBoundingClientRect) continue;
+        const rect = node.getBoundingClientRect();
+        if (!rect.width || !rect.height || rect.top < 0 || rect.bottom > 150) continue;
+        const height = launch.getBoundingClientRect().height || 41;
+        const width = launch.getBoundingClientRect().width || 150;
+        const left = Math.round(rect.right + 12), top = Math.max(8, Math.round(rect.top + (rect.height - height) / 2));
+        if (left + width + 16 <= window.innerWidth) position = 'top:' + top + 'px!important;left:' + left + 'px!important;bottom:auto!important;right:auto!important;';
+        break;
+      }
+      host.style.cssText = 'position:fixed!important;display:block!important;visibility:visible!important;opacity:1!important;z-index:2147483647!important;' + position;
+    };
+    let placementPending = false;
+    const schedulePlacement = () => {
+      if (placementPending) return;
+      placementPending = true;
+      const run = () => { placementPending = false; placeLaunch(); };
+      if (window.requestAnimationFrame) window.requestAnimationFrame(run); else run();
+    };
+    window.addEventListener?.('resize', schedulePlacement, { passive: true });
+    window.addEventListener?.('scroll', schedulePlacement, { passive: true });
+    schedulePlacement();
     el('style', '.licence-combo{position:relative;display:flex;width:215px;border:1px solid #465267;border-radius:4px;background:#242a38}.licence-combo:focus-within{border-color:#409eff}.licence-combo input{width:175px;border:0;background:transparent;border-radius:4px;padding:10px 12px}.licence-combo .licence-toggle{width:38px;padding:0;background:transparent;color:#b5bfce;border-radius:0;font-size:17px}.licence-menu{position:absolute;top:calc(100% + 7px);left:0;right:0;z-index:20;margin:0;padding:6px 0;list-style:none;background:#242a38;border:1px solid #465267;border-radius:4px;box-shadow:0 6px 18px #0005;max-height:240px;overflow:auto}.licence-menu[hidden]{display:none}.licence-menu button{width:100%;border-radius:0;padding:10px 16px;text-align:left;background:transparent;color:#edf0f7;font-weight:400}.licence-menu button:hover,.licence-menu button:focus{background:#303b4e}.licence-menu button.selected{color:#409eff;font-weight:700;background:#203b58}.licence-empty{padding:12px;color:#aeb9cc;font-size:12px}', root);
     panel = el('dialog', null, root); panel.setAttribute('aria-label', 'Shop-Racing Archives audio');
     const header = el('header', null, panel); el('h2', 'Shop-Racing · Archives audio', header);
@@ -907,6 +931,7 @@
     if (typeof MutationObserver !== 'undefined') {
       restoreObserver = new MutationObserver(() => {
         if (document.body && !host.isConnected) document.body.appendChild(host);
+        schedulePlacement();
       });
       restoreObserver.observe(document.documentElement || document, { childList: true, subtree: true });
     }
