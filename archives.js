@@ -1,7 +1,7 @@
 /* Shop-Racing Archives audio. No credentials are stored or sent outside this session. */
 (function () {
   'use strict';
-  const VERSION = '1.0.7';
+  const VERSION = '1.0.8';
   const MAX_BYTES = 512 * 1024 * 1024;
   const AUDIO_PATH = /\/ptt\/audio(?:;jsessionid=[^/;]+)?\/?$/i;
   function groupPath(path) {
@@ -153,10 +153,12 @@
     if (status && !busy) status.textContent = 'Session détectée. Saisissez la licence puis chargez les archives.';
   }
   const nativeFetch = window.fetch ? window.fetch.bind(window) : fetch;
+  let nativeXHR = null;
   function installXHRHook() {
   const originalOpen = XMLHttpRequest.prototype.open;
   const originalSetHeader = XMLHttpRequest.prototype.setRequestHeader;
   const originalSend = XMLHttpRequest.prototype.send;
+  nativeXHR = { Constructor: XMLHttpRequest, open: originalOpen, setHeader: originalSetHeader, send: originalSend };
   const xhrInfo = new WeakMap();
   XMLHttpRequest.prototype.open = function (method, url) {
     const result = originalOpen.apply(this, arguments);
@@ -166,7 +168,7 @@
   };
   XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
     const result = originalSetHeader.apply(this, arguments), info = xhrInfo.get(this);
-    if (info && /^(authorization|x-.*token|token|sessionid|x-requested-with)$/i.test(name)) info.headers[name] = String(value);
+    if (info && /^(accept|content-type|authorization|x-[\w-]+|token|sessionid)$/i.test(name)) info.headers[name] = String(value);
     return result;
   };
   XMLHttpRequest.prototype.send = function () {
@@ -368,7 +370,22 @@
       opts.headers['Content-Type'] = 'application/x-www-form-urlencoded;charset=UTF-8';
       opts.body = url.searchParams.toString();
     }
-    const r = await nativeFetch(url, opts);
+    const r = nativeXHR ? await new Promise((resolve, reject) => {
+      const xhr = new nativeXHR.Constructor();
+      const cleanup = () => timed.signal.removeEventListener('abort', abortXHR);
+      const abortXHR = () => { xhr.abort(); cleanup(); reject(new DOMException('Cancelled', 'AbortError')); };
+      xhr.onload = () => { cleanup(); resolve({ ok: xhr.status >= 200 && xhr.status < 300, status: xhr.status,
+        json: async () => JSON.parse(xhr.responseText) }); };
+      xhr.onerror = () => { cleanup(); reject(new TypeError('Network request failed')); };
+      xhr.onabort = () => { cleanup(); reject(new DOMException('Cancelled', 'AbortError')); };
+      xhr.ontimeout = () => { expired = true; cleanup(); reject(new DOMException('Timed out', 'TimeoutError')); };
+      nativeXHR.open.call(xhr, opts.method, url.href, true);
+      xhr.withCredentials = opts.credentials === 'include'; xhr.timeout = 30000;
+      for (const [name, value] of Object.entries(opts.headers)) nativeXHR.setHeader.call(xhr, name, value);
+      timed.signal.addEventListener('abort', abortXHR, { once: true });
+      if (timed.signal.aborted) { abortXHR(); return; }
+      nativeXHR.send.call(xhr, opts.body || null);
+    }) : await nativeFetch(url, opts);
     if (!r.ok) throw new Error(r.status === 401 || r.status === 403 ? 'Session expirée ou accès refusé.' : r.status === 503 ? 'Serveur temporairement indisponible (503). Réessayez lorsque la recherche audio habituelle fonctionne.' : 'Erreur serveur pendant le chargement (HTTP ' + r.status + ').');
     try { return await r.json(); } catch (_) { throw new Error('Réponse serveur non JSON. Rouvrez les archives natives.'); }
     } catch (e) {
@@ -413,6 +430,7 @@
     // Empty group_id reuses the authenticated session without narrowing the group discovery.
     base.searchParams.set('group_id', '');
     const groupURL = new URL(base); groupURL.pathname = groupPath(groupURL.pathname);
+    let stage = 'Recherche des groupes';
     groupURL.searchParams.set('method', 'get');
     for (const key of ['audio_id', 'user_id', 'start_time', 'end_time', 'begin_time', 'start_date', 'end_date', 'date', 'keyword']) {
       groupURL.searchParams.delete(key); base.searchParams.delete(key);
@@ -431,6 +449,7 @@
       if (!candidates.size) { complete = true; message('Aucun groupe correspondant à cette licence.'); return; }
       const unique = new Map(); let index = 0;
       for (const g of candidates.values()) {
+        stage = 'Chargement des audios de ' + g.label;
         index++; message('Chargement du groupe ' + index + '/' + candidates.size + '…');
         // The audio action belongs to the captured session (for example getByUser).
         // Changing it to the group API's action can change permissions or hit another backend route.
@@ -444,7 +463,7 @@
       const missing = records.filter(r => !r.url).length;
       message(records.length + ' audios, du plus ancien au plus récent.' + (missing ? ' ' + missing + ' sans lien exploitable.' : ''));
     } catch (e) {
-      records = []; tbody.replaceChildren(); message(signal.aborted ? 'Chargement annulé.' : e.message);
+      records = []; tbody.replaceChildren(); message(signal.aborted ? 'Chargement annulé.' : stage + ' : ' + e.message);
     } finally { progress.value = 0; setBusy(false); }
   }
   function filename(r, index, type) {
