@@ -1,7 +1,7 @@
 /* Shop-Racing Archives audio. No credentials are stored or sent outside this session. */
 (function () {
   'use strict';
-  const VERSION = '1.2.1';
+  const VERSION = '1.3.0';
   const MAX_BYTES = 512 * 1024 * 1024;
   const AUDIO_PATH = /\/ptt\/audio(?:;jsessionid=[^/;]+)?\/?$/i;
   function groupPath(path) {
@@ -37,6 +37,13 @@
       const d = new Date(r.time); return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
     }))).sort();
     return !dates.length ? 'Date-inconnue' : dates.length === 1 ? dates[0] : dates[0] + '_au_' + dates[dates.length - 1];
+  }
+  function searchDate(value) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?$/.exec(String(value || ''));
+    if (!m) return null;
+    const d = new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0));
+    if (d.getFullYear() !== +m[1] || d.getMonth() !== +m[2] - 1 || d.getDate() !== +m[3] || d.getHours() !== +m[4] || d.getMinutes() !== +m[5] || d.getSeconds() !== +(m[6] || 0)) return null;
+    return m[1] + '-' + m[2] + '-' + m[3] + ' ' + m[4] + ':' + m[5] + ':' + (m[6] || '00');
   }
   const crcTable = Uint32Array.from({ length: 256 }, (_, n) => {
     let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; return c >>> 0;
@@ -156,7 +163,7 @@
     throw new Error('Limite de pagination atteinte : recherche incomplète.');
   }
   if (typeof window === 'undefined' && typeof module === 'object' && module.exports) {
-    module.exports = { safeName, roleLicense, dropdownGroup, timestamp, recordingDates, crc32, makeZip, wavHeader, monoPCM, filename, listEnvelope, paginate, portalPages, AUDIO_PATH, groupPath }; return;
+    module.exports = { safeName, roleLicense, dropdownGroup, timestamp, recordingDates, searchDate, crc32, makeZip, wavHeader, monoPCM, filename, listEnvelope, paginate, portalPages, AUDIO_PATH, groupPath }; return;
   }
   if (window.__shopRacingArchives && typeof window.__shopRacingArchives.restore === 'function') {
     window.__shopRacingArchives.restore(); return;
@@ -165,7 +172,7 @@
   window.__shopRacingArchives = { version: VERSION };
   let sessionURL = null, capturedHeaders = {}, sessionMethod = 'GET', sessionCredentials = 'same-origin';
   let records = [], busy = false, complete = false, controller;
-  let panel, status, queryBox, loadButton, nativeQueryButton, zipButton, mergeButton, tbody, licence, progress, cancelButton;
+  let panel, status, queryBox, loadButton, dateInput, zipButton, mergeButton, tbody, licence, progress, cancelButton;
   let portalHost, restoreObserver, waitingForBody = false;
   let licenceList, suggestionsTask = null;
   const sessionWaiters = new Set();
@@ -351,7 +358,23 @@
     }
     return found;
   }
-  async function detectWithNativeQuery(force) {
+  function pageDateInput() {
+    for (const root of portalRoots()) {
+      const input = root.querySelectorAll('.audio-records .el-date-editor input, .audio-records input[placeholder="Select Time"]')[0];
+      if (input) return input;
+    }
+    return null;
+  }
+  function syncPageDate(value) {
+    const input = pageDateInput(); if (!input || !value) return;
+    const scope = input.ownerDocument.defaultView;
+    const setter = Object.getOwnPropertyDescriptor(scope.HTMLInputElement.prototype, 'value').set;
+    setter.call(input, value);
+    for (const event of ['input', 'change']) input.dispatchEvent(new scope.Event(event, { bubbles: true }));
+    input.dispatchEvent(new scope.KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
+    input.dispatchEvent(new scope.Event('blur', { bubbles: true }));
+  }
+  async function detectWithNativeQuery(force, date) {
     if (!force && discover()) return true;
     let button;
     for (const root of portalRoots()) {
@@ -373,7 +396,7 @@
       };
       sessionWaiters.add(done);
       timer = setTimeout(() => done(false), 10000);
-      try { if (wasOpen) panel.close(); button.click(); } catch (_) { done(false); }
+      try { if (wasOpen) panel.close(); syncPageDate(date); button.click(); } catch (_) { done(false); }
     });
   }
   function offerLicences(groups) {
@@ -408,7 +431,7 @@
   }
   function setBusy(value) {
     busy = value; loadButton.disabled = value; zipButton.disabled = value || !complete || !records.length;
-    nativeQueryButton.disabled = value;
+    dateInput.disabled = value;
     mergeButton.disabled = value || !complete || !records.length;
     licence.disabled = value; cancelButton.hidden = !value;
   }
@@ -452,9 +475,11 @@
     if (busy) return;
     const number = licence.value.trim();
     if (!/^\d+$/.test(number)) { message('Saisissez un numéro de licence composé de chiffres.'); licence.focus(); return; }
-    if (!sessionURL) {
+    const chosenDate = searchDate(dateInput.value);
+    if (!chosenDate) { message('Choisissez une date et une heure valides pour la recherche.'); dateInput.focus(); return; }
+    {
       setBusy(true);
-      try { await detectWithNativeQuery(); } finally { setBusy(false); }
+      try { await detectWithNativeQuery(true, chosenDate); } finally { setBusy(false); }
     }
     if (!sessionURL) {
       const raw = queryBox.querySelector('input').value.trim();
@@ -468,6 +493,7 @@
     complete = false; records = []; tbody.replaceChildren(); setBusy(true);
     controller = new AbortController(); const signal = controller.signal;
     const base = new URL(sessionURL), headers = { ...capturedHeaders };
+    base.searchParams.set('start_time', chosenDate);
     // Empty group_id reuses the authenticated session without narrowing the group discovery.
     base.searchParams.set('group_id', '');
     const groupURL = new URL(base); groupURL.pathname = groupPath(groupURL.pathname);
@@ -503,7 +529,7 @@
       records.sort((a, b) => (Number.isFinite(a.time) ? a.time : Infinity) - (Number.isFinite(b.time) ? b.time : Infinity) || a.id.localeCompare(b.id));
       renderRows(); complete = true;
       const missing = records.filter(r => !r.url).length;
-      message(records.length + ' audios, du plus ancien au plus récent.' + (missing ? ' ' + missing + ' sans lien exploitable.' : ''));
+      message(records.length + ' audios à partir du ' + chosenDate + ', du plus ancien au plus récent.' + (missing ? ' ' + missing + ' sans lien exploitable.' : ''));
     } catch (e) {
       records = []; tbody.replaceChildren(); message(signal.aborted ? 'Chargement annulé.' : stage + ' : ' + e.message);
     } finally { progress.value = 0; setBusy(false); }
@@ -660,17 +686,9 @@
     const label = el('label', 'Licence', tools); licence = el('input', null, label); licence.inputMode = 'numeric'; licence.placeholder = 'Numéro de licence';
     licence.setAttribute('list', 'sr-licences'); licence.setAttribute('autocomplete', 'off');
     licenceList = el('datalist', null, panel); licenceList.id = 'sr-licences';
+    const dateLabel = el('label', 'Date et heure de début', tools); dateInput = el('input', null, dateLabel);
+    dateInput.type = 'datetime-local'; dateInput.step = '1'; dateInput.required = true;
     loadButton = el('button', 'Charger les archives', tools); loadButton.onclick = load;
-    nativeQueryButton = el('button', 'Lancer Query de la page', tools);
-    nativeQueryButton.onclick = async () => {
-      if (busy || suggestionsTask) return;
-      setBusy(true); let detected = false;
-      try { detected = await detectWithNativeQuery(true); }
-      finally { setBusy(false); }
-      if (!detected) { message('Bouton Query de la page introuvable ou aucune requête audio détectée. Ouvrez Audio Records, puis réessayez.'); return; }
-      if (/^\d+$/.test(licence.value.trim())) await load();
-      else { message('Query lancé et session détectée. Choisissez votre licence.'); suggestLicences(); }
-    };
     zipButton = el('button', 'Exporter tous les audios en ZIP', tools); zipButton.disabled = true; zipButton.onclick = exportZip;
     mergeButton = el('button', 'Créer un audio unique (WAV)', tools); mergeButton.disabled = true; mergeButton.onclick = exportMerged;
     cancelButton = el('button', 'Annuler', tools); cancelButton.hidden = true; cancelButton.onclick = () => controller && controller.abort();
@@ -686,6 +704,10 @@
     ['Date / heure', 'Groupe', 'Utilisateur', 'Lecture', 'Téléchargement'].forEach(t => el('th', t, head)); tbody = el('tbody', null, table);
     launch.onclick = () => {
       if (!panel.open) panel.showModal(); discover();
+      if (!dateInput.value) {
+        const initial = searchDate(pageDateInput()?.value) || searchDate(sessionURL?.searchParams.get('start_time'));
+        if (initial) dateInput.value = initial.replace(' ', 'T');
+      }
       if (!licence.value) {
         const selected = Array.from(dropdownGroups().values());
         if (selected.length === 1) licence.value = selected[0].license;
