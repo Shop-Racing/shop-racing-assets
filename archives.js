@@ -1,7 +1,7 @@
 /* Shop-Racing Archives audio. No credentials are stored or sent outside this session. */
 (function () {
   'use strict';
-  const VERSION = '1.0.8';
+  const VERSION = '1.0.9';
   const MAX_BYTES = 512 * 1024 * 1024;
   const AUDIO_PATH = /\/ptt\/audio(?:;jsessionid=[^/;]+)?\/?$/i;
   function groupPath(path) {
@@ -433,7 +433,7 @@
     let stage = 'Recherche des groupes';
     groupURL.searchParams.set('method', 'get');
     for (const key of ['audio_id', 'user_id', 'start_time', 'end_time', 'begin_time', 'start_date', 'end_date', 'date', 'keyword']) {
-      groupURL.searchParams.delete(key); base.searchParams.delete(key);
+      groupURL.searchParams.delete(key);
     }
     try {
       message('Recherche de tous les groupes…'); progress.removeAttribute('value');
@@ -574,7 +574,7 @@
     const close = el('button', 'Fermer', header);
     const closePanel = () => { root.querySelectorAll('audio').forEach(a => a.pause()); panel.close(); launch.focus(); };
     close.onclick = closePanel; panel.addEventListener('cancel', e => { e.preventDefault(); closePanel(); });
-    el('p', 'Retrouvez les échanges de votre licence, du plus ancien au plus récent.', panel);
+    el('p', 'Retrouvez les échanges de votre licence sur la période de la recherche habituelle, du plus ancien au plus récent.', panel);
     el('small', 'Version ' + VERSION, panel);
     const tools = el('div', null, panel); tools.className = 'tools';
     const label = el('label', 'Licence', tools); licence = el('input', null, label); licence.inputMode = 'numeric'; licence.placeholder = 'Numéro de licence';
