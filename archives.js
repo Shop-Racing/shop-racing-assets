@@ -1,7 +1,7 @@
 /* Shop-Racing Archives audio. No credentials are stored or sent outside this session. */
 (function () {
   'use strict';
-  const VERSION = '1.0.9';
+  const VERSION = '1.1.0';
   const MAX_BYTES = 512 * 1024 * 1024;
   const AUDIO_PATH = /\/ptt\/audio(?:;jsessionid=[^/;]+)?\/?$/i;
   function groupPath(path) {
@@ -108,8 +108,28 @@
     }
     throw new Error('Limite de pagination atteinte : chargement incomplet.');
   }
+  // Endpoint contract from the working portal implementation supplied by the user.
+  async function portalPages(base, kind, request, progress) {
+    const result = [], seen = new Set(); let pages = 1;
+    const cap = kind === 'group' ? 30 : 50;
+    for (let page = 0; page < cap; page++) {
+      const u = new URL(base); u.searchParams.set('limit', '100'); u.searchParams.set('page', String(page));
+      const { rows, meta } = listEnvelope(await request(u), kind);
+      const signature = JSON.stringify(rows);
+      if (rows.length && seen.has(signature)) throw new Error('Page répétée : recherche incomplète.');
+      seen.add(signature); result.push(...rows); if (progress) progress(result.length);
+      if (kind === 'group') { if (rows.length < 100) return result; }
+      else {
+        pages = Number(meta.pageSize) || 1;
+        if (!Number.isInteger(pages) || pages < 1 || pages > cap) throw new Error('Pagination audio invalide ou trop volumineuse.');
+        if (!rows.length && page + 1 < pages) throw new Error('Page audio vide avant la fin : recherche incomplète.');
+        if (page + 1 >= pages) return result;
+      }
+    }
+    throw new Error('Limite de pagination atteinte : recherche incomplète.');
+  }
   if (typeof window === 'undefined' && typeof module === 'object' && module.exports) {
-    module.exports = { safeName, roleLicense, dropdownGroup, timestamp, crc32, makeZip, listEnvelope, paginate, AUDIO_PATH, groupPath }; return;
+    module.exports = { safeName, roleLicense, dropdownGroup, timestamp, crc32, makeZip, listEnvelope, paginate, portalPages, AUDIO_PATH, groupPath }; return;
   }
   if (window.__shopRacingArchives && typeof window.__shopRacingArchives.restore === 'function') {
     window.__shopRacingArchives.restore(); return;
@@ -153,12 +173,10 @@
     if (status && !busy) status.textContent = 'Session détectée. Saisissez la licence puis chargez les archives.';
   }
   const nativeFetch = window.fetch ? window.fetch.bind(window) : fetch;
-  let nativeXHR = null;
   function installXHRHook() {
   const originalOpen = XMLHttpRequest.prototype.open;
   const originalSetHeader = XMLHttpRequest.prototype.setRequestHeader;
   const originalSend = XMLHttpRequest.prototype.send;
-  nativeXHR = { Constructor: XMLHttpRequest, open: originalOpen, setHeader: originalSetHeader, send: originalSend };
   const xhrInfo = new WeakMap();
   XMLHttpRequest.prototype.open = function (method, url) {
     const result = originalOpen.apply(this, arguments);
@@ -342,10 +360,10 @@
         if (!sessionURL && !await detectWithNativeQuery()) return;
         const u = new URL(sessionURL); u.pathname = groupPath(u.pathname);
         u.searchParams.set('method', 'get'); u.searchParams.set('group_id', '');
-        for (const key of ['audio_id', 'user_id', 'start_time', 'end_time', 'begin_time', 'start_date', 'end_date', 'date', 'keyword']) u.searchParams.delete(key);
+        for (const key of ['group_id', 'group_name', 'order_type', 'codec_type', 'time', 'audio_id', 'user_id', 'start_time', 'end_time', 'begin_time', 'start_date', 'end_date', 'date', 'keyword']) u.searchParams.delete(key);
         const signal = new AbortController().signal;
         message('Recherche des licences disponibles…');
-        const groups = await paginate(u, 'group', url => jsonRequest(url, { ...capturedHeaders }, signal));
+        const groups = await portalPages(u, 'group', url => jsonRequest(url, { ...capturedHeaders }, signal));
         offerLicences([...hints, ...groups]);
         message('Choisissez une licence dans la liste ou saisissez son numéro.');
       } catch (_) {
@@ -365,32 +383,17 @@
     let expired = false;
     const timer = setTimeout(() => { expired = true; timed.abort(); }, 30000);
     try {
-    const opts = { credentials: sessionCredentials, headers: { ...headers }, signal: timed.signal, cache: 'no-store', method: sessionMethod };
+    const opts = { credentials: 'include', signal: timed.signal, method: sessionMethod };
     if (sessionMethod === 'POST') {
-      opts.headers['Content-Type'] = 'application/x-www-form-urlencoded;charset=UTF-8';
+      opts.headers = { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' };
       opts.body = url.searchParams.toString();
     }
-    const r = nativeXHR ? await new Promise((resolve, reject) => {
-      const xhr = new nativeXHR.Constructor();
-      const cleanup = () => timed.signal.removeEventListener('abort', abortXHR);
-      const abortXHR = () => { xhr.abort(); cleanup(); reject(new DOMException('Cancelled', 'AbortError')); };
-      xhr.onload = () => { cleanup(); resolve({ ok: xhr.status >= 200 && xhr.status < 300, status: xhr.status,
-        json: async () => JSON.parse(xhr.responseText) }); };
-      xhr.onerror = () => { cleanup(); reject(new TypeError('Network request failed')); };
-      xhr.onabort = () => { cleanup(); reject(new DOMException('Cancelled', 'AbortError')); };
-      xhr.ontimeout = () => { expired = true; cleanup(); reject(new DOMException('Timed out', 'TimeoutError')); };
-      nativeXHR.open.call(xhr, opts.method, url.href, true);
-      xhr.withCredentials = opts.credentials === 'include'; xhr.timeout = 30000;
-      for (const [name, value] of Object.entries(opts.headers)) nativeXHR.setHeader.call(xhr, name, value);
-      timed.signal.addEventListener('abort', abortXHR, { once: true });
-      if (timed.signal.aborted) { abortXHR(); return; }
-      nativeXHR.send.call(xhr, opts.body || null);
-    }) : await nativeFetch(url, opts);
+    const r = await nativeFetch(url, opts);
     if (!r.ok) throw new Error(r.status === 401 || r.status === 403 ? 'Session expirée ou accès refusé.' : r.status === 503 ? 'Serveur temporairement indisponible (503). Réessayez lorsque la recherche audio habituelle fonctionne.' : 'Erreur serveur pendant le chargement (HTTP ' + r.status + ').');
     try { return await r.json(); } catch (_) { throw new Error('Réponse serveur non JSON. Rouvrez les archives natives.'); }
     } catch (e) {
       if (expired) throw new Error('Le serveur ne répond pas depuis 30 secondes. Réessayez après une recherche audio habituelle.');
-      if (e instanceof TypeError) throw new Error('Connexion au serveur refusée ou bloquée. Relancez une recherche audio habituelle pour détecter la session.');
+      if (e instanceof TypeError || e.name === 'TypeError') throw new Error('Connexion au serveur refusée ou bloquée. Relancez une recherche audio habituelle pour détecter la session.');
       throw e;
     } finally { clearTimeout(timer); signal.removeEventListener('abort', abort); }
   }
@@ -402,10 +405,11 @@
   function normalizeAudio(a, group, base) {
     const id = a.id ?? a.audio_id ?? a.audioId;
     if (id == null) throw new Error('Un audio ne possède pas d’identifiant : dédoublonnage impossible.');
-    const url = mediaURL(a.audio_url ?? a.file_url ?? a.download_url ?? a.url ?? a.path ?? a.file, base);
+    const url = mediaURL(a.play_url ?? a.audio_url ?? a.file_url ?? a.download_url ?? a.url ?? a.path ?? a.file, base);
+    const downloadURL = mediaURL(a.download_url, base) || url;
     const time = timestamp(a.create_time ?? a.created_at ?? a.start_time ?? a.time ?? a.timestamp ?? a.date);
     const user = a.user_name ?? a.username ?? a.userName ?? a.name ?? a.user_id ?? 'Utilisateur';
-    return { id: String(id), url, time, user: String(user), group };
+    return { id: String(id), url, downloadURL, time, user: String(user), group };
   }
   async function load() {
     if (busy) return;
@@ -432,12 +436,12 @@
     const groupURL = new URL(base); groupURL.pathname = groupPath(groupURL.pathname);
     let stage = 'Recherche des groupes';
     groupURL.searchParams.set('method', 'get');
-    for (const key of ['audio_id', 'user_id', 'start_time', 'end_time', 'begin_time', 'start_date', 'end_date', 'date', 'keyword']) {
+    for (const key of ['audio_id', 'user_id', 'group_id', 'group_name', 'order_type', 'codec_type', 'time', 'start_time', 'end_time', 'begin_time', 'start_date', 'end_date', 'date', 'keyword']) {
       groupURL.searchParams.delete(key);
     }
     try {
       message('Recherche de tous les groupes…'); progress.removeAttribute('value');
-      const groups = await paginate(groupURL, 'group', u => jsonRequest(u, headers, signal), n => message(n + ' groupes examinés…'));
+      const groups = await portalPages(groupURL, 'group', u => jsonRequest(u, headers, signal), n => message(n + ' groupes examinés…'));
       candidates.clear();
       // UI hints complement the full API listing; they never prove that every group is loaded.
       for (const g of dropdownGroups().values()) if (g.license === number) candidates.set(g.id, { id: g.id, label: g.label });
@@ -454,7 +458,8 @@
         // The audio action belongs to the captured session (for example getByUser).
         // Changing it to the group API's action can change permissions or hit another backend route.
         const u = new URL(base); u.searchParams.set('group_id', g.id);
-        const rows = await paginate(u, 'audio', x => jsonRequest(x, headers, signal), n => message(g.label + ' : ' + n + ' audios reçus…'));
+        u.searchParams.set('order_type', 'desc');
+        const rows = await portalPages(u, 'audio', x => jsonRequest(x, headers, signal), n => message(g.label + ' : ' + n + ' audios reçus…'));
         for (const a of rows) { const r = normalizeAudio(a, g.label, base); if (!unique.has(r.id)) unique.set(r.id, r); }
         records = Array.from(unique.values());
       }
@@ -473,8 +478,8 @@
     return safeName(String(index + 1).padStart(5, '0') + '_' + date + '_' + r.group) + '.' + ext;
   }
   async function audioBytes(r, signal, remaining) {
-    if (!r.url) throw new Error('Lien audio indisponible.');
-    const u = new URL(r.url), same = u.origin === location.origin;
+    if (!r.downloadURL && !r.url) throw new Error('Lien audio indisponible.');
+    const u = new URL(r.downloadURL || r.url), same = u.origin === location.origin;
     const response = await fetch(u, { mode: 'cors', credentials: same ? 'same-origin' : 'omit', signal, redirect: 'error' });
     if (!response.ok || response.type === 'opaque') throw new Error('Audio inaccessible.');
     const type = response.headers.get('content-type') || '';
@@ -510,7 +515,7 @@
         audio.setAttribute('aria-label', 'Écouter l’audio ' + (i + 1));
         audio.addEventListener('error', () => { const note = cell.querySelector('span') || el('span', '', cell); note.textContent = 'Lecture indisponible.'; });
       } else el('span', 'Lien indisponible', cell);
-      const save = el('button', 'Télécharger', el('td', null, tr)); save.disabled = !r.url;
+      const save = el('button', 'Télécharger', el('td', null, tr)); save.disabled = !r.downloadURL && !r.url;
       save.onclick = async () => {
         if (busy) return; setBusy(true); controller = new AbortController(); save.disabled = true;
         try { const f = await audioBytes(r, controller.signal, MAX_BYTES); download(new Blob([f.bytes], { type: f.type }), filename(r, i, f.type)); message('Téléchargement demandé au navigateur.'); }
