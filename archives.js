@@ -1,12 +1,18 @@
 /* Shop-Racing Archives audio. No credentials are stored or sent outside this session. */
 (function () {
   'use strict';
-  const VERSION = '1.5.0';
+  const VERSION = '1.5.1';
   const MAX_BYTES = 512 * 1024 * 1024;
   const AUDIO_PATH = /\/ptt\/audio(?:;jsessionid=[^/;]+)?\/?$/i;
   function groupPath(path) {
     if (!AUDIO_PATH.test(path)) throw new Error('Adresse audio non reconnue.');
     return path.replace(/(\/ptt\/)audio((?:;jsessionid=[^/;]+)?\/?)$/i, '$1group$2');
+  }
+  function loginRoute(href) {
+    try {
+      const u = new URL(href, 'https://example.invalid');
+      return [u.pathname, u.hash.slice(1).split('?')[0]].some(path => /(?:^|\/)(?:login|log-in|signin|sign-in|connexion)(?:\/|$)/i.test(path));
+    } catch (_) { return false; }
   }
   function safeName(value) {
     let s = String(value || 'audio').normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
@@ -168,7 +174,7 @@
     throw new Error('Limite de pagination atteinte : recherche incomplète.');
   }
   if (typeof window === 'undefined' && typeof module === 'object' && module.exports) {
-    module.exports = { safeName, roleLicense, dropdownGroup, timestamp, recordingDates, searchDate, crc32, makeZip, wavHeader, monoPCM, filename, listEnvelope, paginate, portalPages, AUDIO_PATH, groupPath }; return;
+    module.exports = { safeName, roleLicense, dropdownGroup, timestamp, recordingDates, searchDate, crc32, makeZip, wavHeader, monoPCM, filename, loginRoute, listEnvelope, paginate, portalPages, AUDIO_PATH, groupPath }; return;
   }
   if (window.__shopRacingArchives && typeof window.__shopRacingArchives.restore === 'function') {
     window.__shopRacingArchives.restore(); return;
@@ -181,8 +187,10 @@
   let portalHost, restoreObserver, waitingForBody = false;
   let licenceList, licenceToggle, licenceNumbers = [], suggestionsTask = null;
   const sessionWaiters = new Set();
+  const activeRequests = new Set(), outputURLs = new Set();
   let nativeQueryIssue = '';
   let nativeAudioResult = null;
+  let onLoginPage = false, authGeneration = 0, sessionTimingFloor = 0, refreshPortalVisibility = () => {};
   let queuePlayer, queueButton, queueStop, queueStatus, queueIndex = -1, queueSkipped = 0;
   const aliasFields = new Map();
   let displayNames = {};
@@ -199,6 +207,36 @@
     for (const [role, input] of aliasFields) input.value = displayNames[licence.value.trim()]?.[role] || '';
   }
   const candidates = new Map();
+  function isLoginPage() {
+    if (loginRoute(location.href)) return true;
+    if (!document.querySelectorAll) return false;
+    return Array.from(document.querySelectorAll('.site-page--login, .login-container, .login-form, form[action*="login"], form[action*="signin"]'))
+      .some(node => !node.getClientRects || node.getClientRects().length > 0);
+  }
+  function clearRadioSession() {
+    authGeneration++;
+    sessionTimingFloor = performance.now ? performance.now() : 0;
+    controller?.abort();
+    for (const request of activeRequests) request.abort();
+    activeRequests.clear();
+    for (const url of outputURLs) revokeOutputURL(url);
+    outputURLs.clear();
+    for (const ready of sessionWaiters) ready(false);
+    sessionWaiters.clear();
+    sessionURL = null; capturedHeaders = {}; nativeAudioResult = null;
+    sessionMethod = 'GET'; sessionCredentials = 'same-origin';
+    records = []; complete = false; candidates.clear(); licenceNumbers = [];
+    stopQueue();
+    if (panel) { for (const audio of panel.querySelectorAll('audio')) audio.pause(); if (panel.open) panel.close(); }
+    if (status) status.textContent = '';
+    if (tbody) tbody.replaceChildren();
+    for (const field of aliasFields.values()) field.value = '';
+    if (licenceList) licenceList.replaceChildren();
+    if (licence) licence.value = '';
+    if (dateInput) dateInput.value = '';
+    if (queryBox) { queryBox.querySelector('input').value = ''; queryBox.hidden = true; }
+    if (mergeButton && queueButton) setBusy(false);
+  }
   function audioRequest(value, observed) {
     try {
       const u = new URL(String(value), location.href);
@@ -207,6 +245,7 @@
     } catch (_) { return null; }
   }
   function capture(value, headers, method, body, credentials, observed) {
+    if (isLoginPage()) return;
     const u = audioRequest(value, observed); if (!u) return;
     const verb = String(method || 'GET').toUpperCase(); if (!['GET', 'POST'].includes(verb)) return;
     // Reuse form parameters only. Never inspect unrelated requests or persistent storage.
@@ -230,8 +269,10 @@
   }
   const nativeFetch = window.fetch ? window.fetch.bind(window) : fetch;
   function observeAudioCompletion(xhr, info) {
+    const generation = authGeneration;
     const finished = () => {
       try {
+        if (generation !== authGeneration || isLoginPage()) return;
         if (xhr.status < 200 || xhr.status >= 300) return;
         const payload = xhr.responseType === 'json' ? xhr.response : JSON.parse(xhr.responseText);
         listEnvelope(payload, 'audio');
@@ -356,6 +397,7 @@
     } catch (_) { /* Respect browser origin boundaries. */ }
   }
   function discover() {
+    if (isLoginPage()) return false;
     scanFrames(window);
     if (sessionURL) return true;
     // Resource timing only, including accessible portal frames; no storage or cookies are scanned.
@@ -364,6 +406,7 @@
     try { const p = scope.performance || (scope === window ? performance : null); entries = p && p.getEntriesByType ? p.getEntriesByType('resource') : []; }
     catch (_) { continue; }
     for (let i = entries.length - 1; i >= 0; i--) {
+      if (sessionTimingFloor && (!Number.isFinite(entries[i].startTime) || entries[i].startTime < sessionTimingFloor)) continue;
       const observed = ['xmlhttprequest', 'fetch'].includes(entries[i].initiatorType);
       const u = audioRequest(entries[i].name, observed); if (u) { capture(u, {}, 'GET', null, 'same-origin', observed); return true; }
     }
@@ -489,7 +532,7 @@
       const wasOpen = panel && panel.open;
       const done = success => {
         clearTimeout(timer); sessionWaiters.delete(done);
-        if (wasOpen && !panel.open) panel.showModal();
+        if (wasOpen && !panel.open && !isLoginPage()) panel.showModal();
         resolve(success);
       };
       sessionWaiters.add(done);
@@ -540,7 +583,7 @@
     if (existing) {
       const reopen = panel?.open; if (reopen) panel.close();
       try { if (!existing.classList?.contains('is-active')) existing.click(); await Promise.resolve(); }
-      finally { if (reopen && !panel.open) panel.showModal(); }
+      finally { if (reopen && !panel.open && !isLoginPage()) panel.showModal(); }
       return;
     }
     if (pageDateInput()) return;
@@ -571,7 +614,7 @@
         await new Promise(resolve => setTimeout(resolve, 100));
       }
       throw new Error('La page Audio Records ne s’est pas ouverte. Réessayez après la connexion.');
-    } finally { if (wasOpen && !panel.open) panel.showModal(); }
+    } finally { if (wasOpen && !panel.open && !isLoginPage()) panel.showModal(); }
   }
   function suggestLicences() {
     if (suggestionsTask || busy) return;
@@ -608,7 +651,10 @@
   }
   function message(text) { status.textContent = text; }
   async function jsonRequest(url, headers, signal) {
+    const generation = authGeneration;
+    if (isLoginPage()) throw new DOMException("Session ended", "AbortError");
     const timed = new AbortController();
+    activeRequests.add(timed);
     const abort = () => timed.abort(); signal.addEventListener('abort', abort, { once: true });
     if (signal.aborted) timed.abort();
     let expired = false;
@@ -621,12 +667,15 @@
     }
     const r = await nativeFetch(url, opts);
     if (!r.ok) throw new Error(r.status === 401 || r.status === 403 ? 'Session expirée ou accès refusé.' : r.status === 503 ? 'Serveur temporairement indisponible (503). Réessayez lorsque la recherche audio habituelle fonctionne.' : 'Erreur serveur pendant le chargement (HTTP ' + r.status + ').');
-    try { return await r.json(); } catch (_) { throw new Error('Réponse serveur non JSON. Rouvrez les archives natives.'); }
+    let payload;
+    try { payload = await r.json(); } catch (_) { throw new Error('Réponse serveur non JSON. Rouvrez les archives natives.'); }
+    if (generation !== authGeneration || isLoginPage()) throw new DOMException('Session ended', 'AbortError');
+    return payload;
     } catch (e) {
       if (expired) throw new Error('Le serveur ne répond pas depuis 30 secondes. Réessayez après une recherche audio habituelle.');
       if (e instanceof TypeError || e.name === 'TypeError') throw new Error('Connexion au serveur refusée ou bloquée. Relancez une recherche audio habituelle pour détecter la session.');
       throw e;
-    } finally { clearTimeout(timer); signal.removeEventListener('abort', abort); }
+    } finally { activeRequests.delete(timed); clearTimeout(timer); signal.removeEventListener('abort', abort); }
   }
   function mediaURL(value, base) {
     if (typeof value !== 'string' || !value) return null;
@@ -752,9 +801,11 @@
     for (const c of chunks) { bytes.set(c, offset); offset += c.length; }
     return { bytes, type };
   }
+  function createOutputURL(blob) { const url = URL.createObjectURL(blob); outputURLs.add(url); return url; }
+  function revokeOutputURL(url) { URL.revokeObjectURL(url); outputURLs.delete(url); }
   function download(blob, name) {
-    const url = URL.createObjectURL(blob), a = el('a', null, document.body);
-    a.href = url; a.download = name; a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 60000);
+    const url = createOutputURL(blob), a = el('a', null, document.body);
+    a.href = url; a.download = name; a.click(); a.remove(); setTimeout(() => revokeOutputURL(url), 60000);
   }
   function renderRows() {
     tbody.replaceChildren(); const fragment = document.createDocumentFragment();
@@ -825,13 +876,13 @@
       const blob = new Blob([wavHeader(size, context.sampleRate), ...chunks], { type: 'audio/wav' });
       const name = 'Shop-Racing_' + recordingDates(mergedRecords) + '_Licence-' + safeName(licence.value) + '_Echanges-chronologiques' + (failures ? '_PARTIEL' : '') + '.wav';
       message('Audio unique prêt : ' + chunks.length + '/' + records.length + ' enregistrements, à la suite sans les temps de silence entre échanges.' + (failures ? ' ' + failures + ' échecs : fichier partiel.' : ''));
-      const save = el('button', 'Télécharger l’audio unique', status), url = URL.createObjectURL(blob);
+      const save = el('button', 'Télécharger l’audio unique', status), url = createOutputURL(blob);
       save.onclick = () => {
         const a = el('a', null, document.body); a.href = url; a.download = name; a.click(); a.remove(); save.disabled = true;
         message('Téléchargement de l’audio unique demandé au navigateur. Vérifiez vos téléchargements.');
-        setTimeout(() => URL.revokeObjectURL(url), 60000);
+        setTimeout(() => revokeOutputURL(url), 60000);
       };
-      setTimeout(() => { URL.revokeObjectURL(url); if (save.isConnected) { save.disabled = true; save.textContent = 'Fichier expiré — relancez la fusion'; } }, 600000);
+      setTimeout(() => { revokeOutputURL(url); if (save.isConnected) { save.disabled = true; save.textContent = 'Fichier expiré — relancez la fusion'; } }, 600000);
     } catch (e) { message(signal.aborted ? 'Fusion annulée.' : (e instanceof RangeError ? e.message : 'Fusion impossible. Aucun téléchargement demandé.')); }
     finally { if (context) await context.close().catch(() => {}); setBusy(false); }
   }
@@ -855,7 +906,7 @@
       const name = 'Shop-Racing-Archives-' + safeName(licence.value) + (failures.length ? '-partiel' : '') + '.zip';
       // A separate user click after preparation permits a real save and avoids claiming success early.
       const save = el('button', 'Télécharger le ZIP (' + files.length + ' audios)', status);
-      preparedURL = URL.createObjectURL(blob);
+      preparedURL = createOutputURL(blob);
       message('ZIP prêt : ' + files.length + '/' + records.length + ' audios.' + (failures.length ? ' ' + failures.length + ' échecs (accès/CORS/volume). Archive partielle.' : '') + ' Cliquez pour le télécharger.');
       status.appendChild(save);
       const url = preparedURL;
@@ -863,10 +914,10 @@
         const a = el('a', null, document.body); a.href = url; a.download = name; a.click(); a.remove();
         save.disabled = true;
         message('Téléchargement du ZIP demandé au navigateur (' + files.length + '/' + records.length + ' audios). Vérifiez vos téléchargements.');
-        setTimeout(() => URL.revokeObjectURL(url), 60000);
+        setTimeout(() => revokeOutputURL(url), 60000);
       };
-      setTimeout(() => { URL.revokeObjectURL(url); if (save.isConnected) { save.disabled = true; save.textContent = 'ZIP expiré — relancez l’export'; } }, 10 * 60000);
-    } catch (_) { if (preparedURL) URL.revokeObjectURL(preparedURL); message(signal.aborted ? 'Export annulé : aucun téléchargement demandé.' : 'Création du ZIP impossible : aucun téléchargement demandé.'); }
+      setTimeout(() => { revokeOutputURL(url); if (save.isConnected) { save.disabled = true; save.textContent = 'ZIP expiré — relancez l’export'; } }, 10 * 60000);
+    } catch (_) { if (preparedURL) revokeOutputURL(preparedURL); message(signal.aborted ? 'Export annulé : aucun téléchargement demandé.' : 'Création du ZIP impossible : aucun téléchargement demandé.'); }
     finally { setBusy(false); }
   }
   function mount() {
@@ -876,6 +927,7 @@
     }
     if (portalHost) {
       if (!portalHost.isConnected) document.body.appendChild(portalHost);
+      refreshPortalVisibility();
       return;
     }
     const old = document.getElementById('srbtn'); if (old) old.remove();
@@ -886,6 +938,12 @@
     style.textContent = ':host{font:14px system-ui,sans-serif;color:#edf0f7}*{box-sizing:border-box}button,input{font:inherit}button{cursor:pointer;border:0;border-radius:9px;padding:11px 16px;background:#f57920;color:#131722;font-weight:700}button:disabled{opacity:.5;cursor:default}button:focus-visible,input:focus-visible{outline:3px solid #8ebaff;outline-offset:3px}dialog{color:#edf0f7;background:#151b28;border:1px solid #414b60;border-radius:18px;width:min(1160px,94vw);max-height:90vh;padding:24px}dialog::backdrop{background:#000a}header,.tools{display:flex;gap:12px;align-items:center;flex-wrap:wrap}header{justify-content:space-between}h2{margin:0;font-size:24px}p{color:#b8c4d8}input{border:1px solid #526078;border-radius:8px;padding:10px;background:#0d121d;color:white;max-width:100%}label{display:flex;gap:8px;align-items:center;flex-wrap:wrap}details{margin:16px 0}details input{width:100%;margin-top:8px}progress{width:100%;height:6px;accent-color:#f57920;margin:12px 0}.table{overflow:auto;max-height:52vh}table{border-collapse:collapse;width:100%;text-align:left}th{background:#202a3d;position:sticky;top:0}th,td{padding:12px;border-bottom:1px solid #303a50;white-space:nowrap}audio{width:260px;height:36px}#status{white-space:pre-wrap;overflow-wrap:anywhere;min-height:40px}#status button{margin-left:12px}small{color:#b8c4d8}';
     const launch = el('button', 'ARCHIVES AUDIO', root); launch.setAttribute('aria-haspopup', 'dialog');
     const placeLaunch = () => {
+      if (isLoginPage()) {
+        if (!onLoginPage) { onLoginPage = true; clearRadioSession(); }
+        host.style.cssText = 'display:none!important;';
+        return;
+      }
+      onLoginPage = false;
       let position = 'bottom:16px!important;left:16px!important;top:auto!important;right:auto!important;';
       if (document.querySelectorAll) for (const node of document.querySelectorAll('a,button,li,[role="menuitem"],div,span')) {
         if (!/^(settings|paramètres|parametres)$/i.test(String(node.textContent || '').trim()) || !node.getBoundingClientRect) continue;
@@ -908,6 +966,15 @@
     };
     window.addEventListener?.('resize', schedulePlacement, { passive: true });
     window.addEventListener?.('scroll', schedulePlacement, { passive: true });
+    window.addEventListener?.('popstate', schedulePlacement);
+    window.addEventListener?.('hashchange', schedulePlacement);
+    refreshPortalVisibility = placeLaunch;
+    for (const name of ['pushState', 'replaceState']) {
+      try {
+        const original = window.history?.[name];
+        if (original) window.history[name] = function () { const result = original.apply(this, arguments); placeLaunch(); return result; };
+      } catch (_) { /* DOM and navigation events still refresh visibility. */ }
+    }
     schedulePlacement();
     el('style', '.licence-combo{position:relative;display:flex;width:215px;border:1px solid #465267;border-radius:4px;background:#242a38}.licence-combo:focus-within{border-color:#409eff}.licence-combo input{width:175px;border:0;background:transparent;border-radius:4px;padding:10px 12px}.licence-combo .licence-toggle{width:38px;padding:0;background:transparent;color:#b5bfce;border-radius:0;font-size:17px}.licence-menu{position:absolute;top:calc(100% + 7px);left:0;right:0;z-index:20;margin:0;padding:6px 0;list-style:none;background:#242a38;border:1px solid #465267;border-radius:4px;box-shadow:0 6px 18px #0005;max-height:240px;overflow:auto}.licence-menu[hidden]{display:none}.licence-menu button{width:100%;border-radius:0;padding:10px 16px;text-align:left;background:transparent;color:#edf0f7;font-weight:400}.licence-menu button:hover,.licence-menu button:focus{background:#303b4e}.licence-menu button.selected{color:#409eff;font-weight:700;background:#203b58}.licence-empty{padding:12px;color:#aeb9cc;font-size:12px}', root);
     panel = el('dialog', null, root); panel.setAttribute('aria-label', 'Shop-Racing Archives audio');
@@ -984,6 +1051,7 @@
     const head = el('tr', null, el('thead', null, table));
     ['Date / heure', 'Groupe', 'Utilisateur', 'Lecture', 'Téléchargement'].forEach(t => el('th', t, head)); tbody = el('tbody', null, table);
     launch.onclick = () => {
+      if (isLoginPage()) { placeLaunch(); return; }
       if (!panel.open) panel.showModal(); discover();
       if (!dateInput.value) {
         const initial = searchDate(pageDateInput()?.value) || searchDate(sessionURL?.searchParams.get('start_time'));
@@ -1004,7 +1072,7 @@
         if (document.body && !host.isConnected) document.body.appendChild(host);
         schedulePlacement();
       });
-      restoreObserver.observe(document.documentElement || document, { childList: true, subtree: true });
+      restoreObserver.observe(document.documentElement || document, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'hidden'] });
     }
   }
   window.__shopRacingArchives.restore = mount;
