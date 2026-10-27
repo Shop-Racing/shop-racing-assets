@@ -1,7 +1,7 @@
 /* Shop-Racing Historique Audio. No credentials are stored or sent outside this session. */
 (function () {
   'use strict';
-  const VERSION = '1.5.2';
+  const VERSION = '1.6.0';
   const MAX_BYTES = 512 * 1024 * 1024;
   const AUDIO_PATH = /\/ptt\/audio(?:;jsessionid=[^/;]+)?\/?$/i;
   function groupPath(path) {
@@ -206,7 +206,28 @@
   function refreshLabelFields() {
     for (const [role, input] of aliasFields) input.value = displayNames[licence.value.trim()]?.[role] || '';
   }
-  const candidates = new Map();
+  const candidates = new Map(), availableGroups = new Map();
+  let scopeSelect, groupSelect, licenceControl, groupControl, loadedScope = null;
+  function scopeTitle() {
+    return loadedScope?.kind === 'group' ? 'Groupe-' + groupLabel({ group: loadedScope.group }) : 'Licence-' + (loadedScope?.number || licence.value);
+  }
+  function offerGroups(groups) {
+    for (const g of groups) {
+      const id = g.id ?? g.group_id ?? g.groupId;
+      const name = g.group_name ?? g.name ?? g.groupName ?? g.label;
+      if (id != null && typeof name === 'string' && name.trim()) availableGroups.set(String(id), { id: String(id), label: name.trim() });
+    }
+    if (!groupSelect) return;
+    const previous = groupSelect.value; groupSelect.replaceChildren();
+    const first = el('option', 'Choisir un groupe', groupSelect); first.value = '';
+    for (const g of Array.from(availableGroups.values()).sort((a,b) => a.label.localeCompare(b.label, 'fr', {numeric:true}))) {
+      const option = el('option', groupLabel({group:g.label}), groupSelect); option.value = g.id;
+    }
+    groupSelect.value = availableGroups.has(previous) ? previous : '';
+  }
+  function syncScopeControls() {
+    const single = scopeSelect.value === 'group'; licenceControl.hidden = single; groupControl.hidden = !single;
+  }
   function isLoginPage() {
     if (loginRoute(location.href)) return true;
     if (!document.querySelectorAll) return false;
@@ -225,7 +246,9 @@
     sessionWaiters.clear();
     sessionURL = null; capturedHeaders = {}; nativeAudioResult = null;
     sessionMethod = 'GET'; sessionCredentials = 'same-origin';
-    records = []; complete = false; candidates.clear(); licenceNumbers = [];
+    records = []; complete = false; candidates.clear(); availableGroups.clear(); licenceNumbers = []; loadedScope = null;
+    if (groupSelect) { groupSelect.replaceChildren(); groupSelect.value = ''; }
+    if (scopeSelect) { scopeSelect.value = 'licence'; syncScopeControls(); }
     stopQueue();
     if (panel) { for (const audio of panel.querySelectorAll('audio')) audio.pause(); if (panel.open) panel.close(); }
     if (status) status.textContent = '';
@@ -478,8 +501,13 @@
     input.dispatchEvent(new scope.KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
     input.dispatchEvent(new scope.Event('blur', { bubbles: true }));
   }
-  async function syncPageGroup(number) {
-    if (!number) return true;
+  async function syncPageGroup(number, groupId) {
+    if (!number && !groupId) return true;
+    const wanted = groupId && availableGroups.get(groupId);
+    const matchesGroup = text => {
+      const match = /^(.*?)\s*\((\d+)\)\s*$/.exec(String(text || '').trim());
+      return match ? match[2] === groupId : !!wanted && String(text || '').trim() === wanted.label;
+    };
     const roots = portalRoots();
     let select;
     for (const root of roots) {
@@ -489,13 +517,14 @@
     if (!select) return false;
     const current = select.querySelector('input');
     const parsed = dropdownGroup(current?.value);
-    if (parsed?.license === number) return true;
+    if (groupId ? matchesGroup(current?.value) : parsed?.license === number) return true;
     const choose = () => {
       const options = [];
       // Element UI may place the menu inside the select or append it to the document.
       for (const root of roots) for (const node of root.querySelectorAll('.el-select-dropdown__item')) {
         const group = dropdownGroup(node.textContent) || roleLicense(node.textContent);
-        if (group?.license === number && !node.classList?.contains('is-disabled')) options.push({ node, group });
+        const matches = groupId ? (matchesGroup(node.textContent) || String(node.__vue__?.value ?? '') === groupId) : group?.license === number;
+        if (matches && !node.classList?.contains('is-disabled')) options.push({ node, group: group || {role:''} });
       }
       const rank = role => ['VOITURE', 'INGENIEUR', 'MECANO', 'MECANICIEN'].indexOf(role);
       options.sort((a, b) => rank(a.group.role) - rank(b.group.role));
@@ -507,14 +536,14 @@
     await Promise.resolve();
     if (!choose()) {
       await new Promise(resolve => setTimeout(resolve, 200));
-      if (!choose()) { select.click(); throw new Error('Aucun groupe de la licence ' + number + ' dans Select Group. Ouvrez cette liste dans la page et vérifiez la licence.'); }
+      if (!choose()) { select.click(); throw new Error(groupId ? 'Le groupe choisi est introuvable dans Select Group.' : 'Aucun groupe de la licence ' + number + ' dans Select Group. Ouvrez cette liste dans la page et vérifiez la licence.'); }
     }
     await Promise.resolve();
     const selected = dropdownGroup(current?.value);
-    if (selected?.license !== number) throw new Error('La sélection du groupe n’a pas été confirmée. Choisissez un groupe de la licence ' + number + ' dans Select Group puis réessayez.');
+    if (groupId ? !matchesGroup(current?.value) : selected?.license !== number) throw new Error('La sélection du groupe n’a pas été confirmée dans Select Group.');
     return true;
   }
-  async function detectWithNativeQuery(force, date, number) {
+  async function detectWithNativeQuery(force, date, number, groupId) {
     nativeQueryIssue = '';
     if (!force && discover()) return true;
     let button;
@@ -539,12 +568,13 @@
       timer = setTimeout(() => done(false), 10000);
       Promise.resolve().then(async () => {
         if (wasOpen) panel.close();
-        await syncPageGroup(number);
+        await syncPageGroup(number, groupId);
         await syncPageDate(date); button.click();
       }).catch(e => { nativeQueryIssue = e.message || 'Sélection du groupe impossible.'; done(false); });
     });
   }
   function offerLicences(groups) {
+    offerGroups(groups);
     const numbers = new Set();
     for (const group of groups) {
       const parsed = group.license ? group : roleLicense(group.name ?? group.group_name ?? group.groupName);
@@ -644,7 +674,7 @@
   }
   function setBusy(value) {
     busy = value; loadButton.disabled = value; zipButton.disabled = value || !complete || !records.length;
-    dateInput.disabled = value;
+    dateInput.disabled = value; scopeSelect.disabled = value; groupSelect.disabled = value;
     mergeButton.disabled = value || !complete || !records.length;
     queueButton.disabled = value || !records.some(r => r.url);
     licence.disabled = value; licenceToggle.disabled = value; if (value) showLicenceMenu(false); cancelButton.hidden = !value;
@@ -694,13 +724,16 @@
   async function load() {
     if (busy) return;
     stopQueue();
+    const singleGroup = scopeSelect.value === 'group';
+    const selectedGroup = singleGroup && availableGroups.get(groupSelect.value);
     const number = licence.value.trim();
-    if (!/^\d+$/.test(number)) { message('Saisissez un numéro de licence composé de chiffres.'); licence.focus(); return; }
+    if (singleGroup && !selectedGroup) { message('Choisissez le groupe à écouter.'); groupSelect.focus(); return; }
+    if (!singleGroup && !/^\d+$/.test(number)) { message('Saisissez un numéro de licence composé de chiffres.'); licence.focus(); return; }
     const chosenDate = searchDate(dateInput.value);
     if (!chosenDate) { message('Choisissez une date et une heure valides pour la recherche.'); dateInput.focus(); return; }
     {
       setBusy(true);
-      try { await detectWithNativeQuery(true, chosenDate, number); } finally { setBusy(false); }
+      try { await detectWithNativeQuery(true, chosenDate, singleGroup ? null : number, selectedGroup?.id); } finally { setBusy(false); }
     }
     if (nativeQueryIssue) { message(nativeQueryIssue); return; }
     if (!sessionURL) {
@@ -712,6 +745,7 @@
       if (!manual || !manual.search) { message('Query invalide. Utilisez uniquement la requête audio de ce portail.'); return; }
       capture(manual);
     }
+    loadedScope = singleGroup ? { kind: 'group', group: selectedGroup.label } : { kind: 'licence', number };
     complete = false; records = []; tbody.replaceChildren(); setBusy(true);
     controller = new AbortController(); const signal = controller.signal;
     const base = new URL(sessionURL), headers = { ...capturedHeaders };
@@ -729,13 +763,14 @@
       const groups = await portalPages(groupURL, 'group', u => jsonRequest(u, headers, signal), n => message(n + ' groupes examinés…'));
       candidates.clear();
       // UI hints complement the full API listing; they never prove that every group is loaded.
-      for (const g of dropdownGroups().values()) if (g.license === number) candidates.set(g.id, { id: g.id, label: g.label });
+      for (const g of dropdownGroups().values()) if (singleGroup ? g.id === selectedGroup.id : g.license === number) candidates.set(g.id, { id: g.id, label: g.label });
       for (const g of groups) {
         const parsed = roleLicense(g.name ?? g.group_name ?? g.groupName);
         const id = g.id ?? g.group_id ?? g.groupId;
-        if (parsed && parsed.license === number && id != null) candidates.set(String(id), { id: String(id), label: parsed.role + ' ' + parsed.license });
+        if (id != null && (singleGroup ? String(id) === selectedGroup.id : parsed?.license === number))
+          candidates.set(String(id), { id: String(id), label: singleGroup ? selectedGroup.label : parsed.role + ' ' + parsed.license });
       }
-      if (!candidates.size) { complete = true; message('Aucun groupe correspondant à cette licence.'); return; }
+      if (!candidates.size) { complete = true; message(singleGroup ? 'Ce groupe n’est plus disponible.' : 'Aucun groupe correspondant à cette licence.'); return; }
       const unique = new Map(); let index = 0;
       for (const g of candidates.values()) {
         stage = 'Chargement des audios de ' + g.label;
@@ -874,7 +909,7 @@
       }
       if (!chunks.length) { message('Aucun audio décodable : accès CORS ou format non pris en charge. Aucun fichier créé.'); return; }
       const blob = new Blob([wavHeader(size, context.sampleRate), ...chunks], { type: 'audio/wav' });
-      const name = 'Shop-Racing_' + recordingDates(mergedRecords) + '_Licence-' + safeName(licence.value) + '_Echanges-chronologiques' + (failures ? '_PARTIEL' : '') + '.wav';
+      const name = 'Shop-Racing_' + recordingDates(mergedRecords) + '_' + safeName(scopeTitle()) + '_Echanges-chronologiques' + (failures ? '_PARTIEL' : '') + '.wav';
       message('Audio unique prêt : ' + chunks.length + '/' + records.length + ' enregistrements, à la suite sans les temps de silence entre échanges.' + (failures ? ' ' + failures + ' échecs : fichier partiel.' : ''));
       const save = el('button', 'Télécharger l’audio unique', status), url = createOutputURL(blob);
       save.onclick = () => {
@@ -903,7 +938,7 @@
       }
       if (!files.length) { message('Aucun audio récupéré. Accès refusé, liens expirés ou blocage CORS : aucun ZIP créé.'); return; }
       const blob = makeZip(files);
-      const name = 'Shop-Racing-Archives-' + safeName(licence.value) + (failures.length ? '-partiel' : '') + '.zip';
+      const name = 'Shop-Racing-Historique-Audio_' + safeName(scopeTitle()) + (failures.length ? '-partiel' : '') + '.zip';
       // A separate user click after preparation permits a real save and avoids claiming success early.
       const save = el('button', 'Télécharger le ZIP (' + files.length + ' audios)', status);
       preparedURL = createOutputURL(blob);
@@ -985,7 +1020,10 @@
     el('p', 'Retrouvez les échanges de votre licence sur la période de la recherche habituelle, du plus ancien au plus récent.', panel);
     el('small', 'Version ' + VERSION, panel);
     const tools = el('div', null, panel); tools.className = 'tools';
-    const label = el('label', 'Licence', tools), combo = el('div', null, label); combo.className = 'licence-combo';
+    const scopeLabel = el('label', 'Écouter', tools); scopeSelect = el('select', null, scopeLabel);
+    el('option', 'Toute une licence', scopeSelect).value = 'licence'; el('option', 'Un groupe seul', scopeSelect).value = 'group'; scopeSelect.value = 'licence';
+    scopeSelect.onchange = () => { stopQueue(); syncScopeControls(); };
+    const label = el('label', 'Licence', tools), combo = el('div', null, label); combo.className = 'licence-combo'; licenceControl = label;
     licence = el('input', null, combo); licence.inputMode = 'numeric'; licence.placeholder = 'Choisir une licence';
     licence.setAttribute('autocomplete', 'off'); licence.setAttribute('role', 'combobox'); licence.setAttribute('aria-controls', 'sr-licences'); licence.setAttribute('aria-expanded', 'false');
     licenceToggle = el('button', '⌄', combo); licenceToggle.type = 'button'; licenceToggle.className = 'licence-toggle'; licenceToggle.setAttribute('aria-label', 'Afficher les licences');
@@ -1002,6 +1040,10 @@
       }
     };
     combo.addEventListener('focusout', event => { if (!combo.contains(event.relatedTarget)) showLicenceMenu(false); });
+    groupControl = el('label', 'Groupe', tools); groupSelect = el('select', null, groupControl); groupControl.hidden = true;
+    el('option', 'Choisir un groupe', groupSelect).value = '';
+    groupSelect.onchange = () => { const g = availableGroups.get(groupSelect.value), parsed = g && roleLicense(g.label); if (parsed) { licence.value = parsed.license; refreshLabelFields(); } };
+    el('style', '[hidden]{display:none!important}select{font:inherit;border:1px solid #465267;border-radius:4px;background:#242a38;color:#edf0f7;padding:10px 12px;max-width:300px}select:focus-visible{outline:2px solid #409eff}select option{background:#242a38;color:#edf0f7}', root);
     const dateLabel = el('label', 'Date et heure de début', tools); dateInput = el('input', null, dateLabel);
     dateInput.type = 'datetime-local'; dateInput.step = '1'; dateInput.required = true;
     loadButton = el('button', 'Charger les archives', tools); loadButton.onclick = load;
@@ -1022,7 +1064,7 @@
       displayNames[number] = names;
       let persisted = true;
       try { if (!window.localStorage) persisted = false; else window.localStorage.setItem('shop-racing-archive-labels', JSON.stringify(displayNames)); } catch (_) { persisted = false; }
-      renderRows(); updateQueueLabel();
+      renderRows(); updateQueueLabel(); offerGroups([]);
       message('Libellés mis à jour pour la licence ' + number + (persisted ? '.' : ' pour cette session (stockage local indisponible).'));
     };
     const listening = el('div', null, panel); listening.className = 'tools';
