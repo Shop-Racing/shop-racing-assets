@@ -1,7 +1,7 @@
 /* Shop-Racing Historique Audio. No credentials are stored or sent outside this session. */
 (function () {
   'use strict';
-  const VERSION = '1.7.0';
+  const VERSION = '1.7.1';
   const MAX_BYTES = 512 * 1024 * 1024;
   const AUDIO_PATH = /\/ptt\/audio(?:;jsessionid=[^/;]+)?\/?$/i;
   function groupPath(path) {
@@ -206,7 +206,7 @@
   let nativeAudioResult = null;
   let onLoginPage = false, authGeneration = 0, sessionTimingFloor = 0, refreshPortalVisibility = () => {};
   let queuePlayer, queueButton, queueStop, queueStatus, queueIndex = -1, queueSkipped = 0;
-  let mergedPlayback = null, timeline, timelineRange, timelineClock, timelineDate, timelineGo;
+  let mergedPlayback = null, timeline, timelineRange, timelineClock, timelineDate, timelineGo, timelinePlay, listeningControls;
   const aliasFields = new Map();
   let displayNames = {};
   try {
@@ -894,10 +894,12 @@
     queueIndex = -1;
     if (mergedPlayback) { revokeOutputURL(mergedPlayback.url); mergedPlayback = null; }
     if (timeline) timeline.hidden = true;
+    if (listeningControls) listeningControls.hidden = false;
+    if (queueStatus) queueStatus.hidden = false;
     if (!queuePlayer) return;
     queuePlayer.pause(); queuePlayer.removeAttribute('src'); queuePlayer.load?.();
     queueButton.textContent = 'Tout écouter'; queueStop.disabled = true;
-    queueStatus.textContent = text || 'Lecture des échanges dans l’ordre chronologique.';
+    queueStatus.textContent = text || '';
   }
   function updateQueueLabel() {
     if (mergedPlayback) { updateTimeline(); return; }
@@ -912,6 +914,12 @@
     queuePlayer.src = records[index].url;
     try { await queuePlayer.play(); }
     catch (_) { if (queueIndex === index) { queueButton.textContent = 'Reprendre'; queueStatus.textContent += ' — Cliquez sur Reprendre pour lancer la lecture.'; } }
+  }
+  function syncTimelinePlay() {
+    if (!timelinePlay || !queuePlayer) return;
+    timelinePlay.textContent = queuePlayer.paused ? '▶ Lecture' : 'Ⅱ Pause';
+    timelinePlay.setAttribute('aria-label', queuePlayer.paused ? 'Lire l’audio complet' : 'Mettre en pause');
+    timelinePlay.setAttribute('aria-pressed', String(!queuePlayer.paused));
   }
   function updateTimeline() {
     if (!mergedPlayback) return;
@@ -930,7 +938,7 @@
     mergedPlayback = {url, markers, failures};
     queuePlayer.src = url; queuePlayer.currentTime = 0; queueIndex = markers[0].index;
     timelineRange.max = String(markers[markers.length-1].end); timelineRange.value = '0';
-    timeline.hidden = false; queueStop.disabled = false;
+    timeline.hidden = false; listeningControls.hidden = true; queueStatus.hidden = true; queueStop.disabled = false; syncTimelinePlay();
     updateTimeline();
   }
   async function exportMerged(playback = false) {
@@ -964,7 +972,7 @@
       const blob = new Blob([wavHeader(size, context.sampleRate), ...chunks], { type: 'audio/wav' });
       installMergedPlayback(blob, markers, failures);
       const name = 'Shop-Racing_' + recordingDates(mergedRecords) + '_' + safeName(scopeTitle()) + '_Echanges-chronologiques' + (failures ? '_PARTIEL' : '') + '.wav';
-      message('Audio unique prêt : ' + chunks.length + '/' + records.length + ' enregistrements, à la suite sans les temps de silence entre échanges.' + (failures ? ' ' + failures + ' échecs : fichier partiel.' : ''));
+      message('Audio unique prêt : ' + chunks.length + '/' + records.length + (failures ? ' · ' + failures + ' échecs : fichier partiel.' : ''));
       const save = el('button', 'Télécharger l’audio unique', status), url = createOutputURL(blob);
       save.onclick = () => {
         const a = el('a', null, document.body); a.href = url; a.download = name; a.click(); a.remove(); save.disabled = true;
@@ -974,7 +982,7 @@
       setTimeout(() => { revokeOutputURL(url); if (save.isConnected) { save.disabled = true; save.textContent = 'Fichier expiré — relancez la fusion'; } }, 600000);
       if (playback) {
         try { await queuePlayer.play(); }
-        catch (_) { queueButton.textContent = 'Reprendre'; message('Audio complet prêt. Cliquez sur Reprendre pour écouter.'); }
+        catch (_) { queueButton.textContent = 'Reprendre'; message('Audio prêt. Cliquez sur Lecture.'); }
       }
     } catch (e) { message(signal.aborted ? 'Fusion annulée.' : (e instanceof RangeError ? e.message : 'Fusion impossible. Aucun téléchargement demandé.')); }
     finally { if (context) await context.close().catch(() => {}); setBusy(false); }
@@ -1075,7 +1083,6 @@
     const close = el('button', 'Fermer', header);
     const closePanel = () => { root.querySelectorAll('audio').forEach(a => a.pause()); panel.close(); launch.focus(); };
     close.onclick = closePanel; panel.addEventListener('cancel', e => { e.preventDefault(); closePanel(); });
-    el('p', 'Retrouvez les échanges de votre licence sur la période de la recherche habituelle, du plus ancien au plus récent.', panel);
     el('small', 'Version ' + VERSION, panel);
     const tools = el('div', null, panel); tools.className = 'tools';
     const scopeLabel = el('label', 'Écouter', tools); scopeSelect = el('select', null, scopeLabel);
@@ -1109,7 +1116,6 @@
     mergeButton = el('button', 'Créer un audio unique (WAV)', tools); mergeButton.disabled = true; mergeButton.onclick = () => exportMerged(false);
     cancelButton = el('button', 'Annuler', tools); cancelButton.hidden = true; cancelButton.onclick = () => controller && controller.abort();
     const labels = el('details', null, panel); el('summary', 'Modifier les libellés des groupes', labels);
-    el('p', 'Pour la licence choisie : personnalisez les noms affichés et exportés. Laissez vide pour garder le nom d’origine. Réglages mémorisés dans ce navigateur.', labels);
     for (const role of ['VOITURE', 'INGENIEUR', 'MECANO', 'MECANICIEN']) {
       const row = el('label', role, labels), field = el('input', null, row); field.maxLength = 80;
       field.placeholder = role === 'VOITURE' ? 'Ex. Voiture n°23' : 'Libellé personnalisé'; aliasFields.set(role, field);
@@ -1125,14 +1131,14 @@
       renderRows(); updateQueueLabel(); offerGroups([]);
       message('Libellés mis à jour pour la licence ' + number + (persisted ? '.' : ' pour cette session (stockage local indisponible).'));
     };
-    const listening = el('div', null, panel); listening.className = 'tools';
+    const listening = el('div', null, panel); listening.className = 'tools'; listeningControls = listening;
     queueButton = el('button', 'Tout écouter', listening); queueButton.disabled = true;
     queueStop = el('button', 'Arrêter', listening); queueStop.disabled = true; queueStop.onclick = () => { if (mergedPlayback) { queuePlayer.pause(); queuePlayer.currentTime = 0; updateTimeline(); } else stopQueue(); };
     queuePlayer = el('audio', null, listening); queuePlayer.controls = true; queuePlayer.preload = 'none'; queuePlayer.setAttribute('aria-label', 'Lecture successive des archives');
-    queueStatus = el('p', 'Lecture des échanges dans l’ordre chronologique.', panel); queueStatus.setAttribute('role', 'status');
-    queuePlayer.onplay = () => { queueButton.textContent = 'Pause'; };
-    queuePlayer.onpause = () => { if (queueIndex >= 0) queueButton.textContent = 'Reprendre'; };
-    queuePlayer.onended = () => { if (mergedPlayback) { updateTimeline(); queueButton.textContent = 'Reprendre'; } else if (queueIndex >= 0) playQueue(queueIndex + 1); };
+    queueStatus = el('p', '', panel); queueStatus.setAttribute('role', 'status');
+    queuePlayer.onplay = () => { queueButton.textContent = 'Pause'; syncTimelinePlay(); };
+    queuePlayer.onpause = () => { if (queueIndex >= 0) queueButton.textContent = 'Reprendre'; syncTimelinePlay(); };
+    queuePlayer.onended = () => { if (mergedPlayback) { updateTimeline(); queueButton.textContent = 'Reprendre'; syncTimelinePlay(); } else if (queueIndex >= 0) playQueue(queueIndex + 1); };
     queuePlayer.onerror = () => { if (mergedPlayback) { message('Lecture de l’audio complet impossible. Relancez sa préparation.'); return; } if (queueIndex >= 0) { queueSkipped++; playQueue(queueIndex + 1); } };
     queueButton.onclick = async () => {
       if (busy) return;
@@ -1143,6 +1149,8 @@
       else await playQueue(0);
     };
     timeline = el('div', null, panel); timeline.className = 'audio-timeline'; timeline.hidden = true;
+    timelinePlay = el('button', '▶ Lecture', timeline); timelinePlay.type = 'button';
+    timelinePlay.onclick = async () => { if (!mergedPlayback) return; if (queuePlayer.paused) { try { await queuePlayer.play(); } catch (_) { message('Lecture impossible. Réessayez.'); } } else queuePlayer.pause(); syncTimelinePlay(); };
     timelineClock = el('output', '—', timeline); timelineClock.setAttribute('aria-label', 'Date et heure de l’enregistrement');
     timelineRange = el('input', null, timeline); timelineRange.type = 'range'; timelineRange.min = '0'; timelineRange.step = '0.01'; timelineRange.value = '0';
     timelineRange.setAttribute('aria-label', 'Naviguer dans tous les échanges');
@@ -1154,9 +1162,8 @@
       const time = timestamp(timelineDate.value); if (!Number.isFinite(time)) return;
       queuePlayer.currentTime = timelineSeek(mergedPlayback.markers, time); updateTimeline();
     };
-    el('small', 'Échanges à la suite, sans les silences entre appels. L’heure affichée correspond à l’enregistrement d’origine. Une heure sans échange mène au suivant.', timeline);
     queuePlayer.ontimeupdate = updateTimeline; queuePlayer.onseeked = updateTimeline;
-    const timelineStyle = el('style', '.audio-timeline{padding:16px;margin:14px 0;background:#202a3d;border:1px solid #414b60;border-radius:10px}.audio-timeline output{display:block;font-size:20px;font-variant-numeric:tabular-nums;margin-bottom:8px}.audio-timeline input[type=range]{display:block;width:100%;max-width:none;padding:0;margin:12px 0;accent-color:#f57920}.audio-timeline small{display:block;margin-top:10px}', root);
+    const timelineStyle = el('style', '.audio-timeline{padding:16px;margin:14px 0;background:#202a3d;border:1px solid #414b60;border-radius:10px}.audio-timeline output{display:inline-block;margin-left:16px;font-size:20px;font-variant-numeric:tabular-nums;margin-bottom:8px}.audio-timeline input[type=range]{display:block;width:100%;max-width:none;padding:0;margin:12px 0;accent-color:#f57920}', root);
     queryBox = el('details', null, panel); queryBox.hidden = true; queryBox.open = true;
     el('summary', 'Query de session — solution de secours', queryBox);
     const queryLabel = el('label', 'Query', queryBox); const input = el('input', null, queryLabel);
