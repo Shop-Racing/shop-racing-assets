@@ -1,0 +1,13 @@
+{
+  "name": "shop-racing-audio-history",
+  "version": "1.7.1",
+  "private": true,
+  "scripts": {
+    "build": "node scripts/build.cjs",
+    "check": "node scripts/build.cjs --check",
+    "test": "node tests/helpers.test.cjs && node tests/portal.test.cjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

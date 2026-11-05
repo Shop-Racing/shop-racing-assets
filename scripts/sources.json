@@ -1,0 +1,21 @@
+[
+  "src/config.js",
+  "src/utils.js",
+  "src/exports/formats.js",
+  "src/api/pagination.js",
+  "src/runtime/guards.js",
+  "src/runtime/state.js",
+  "src/ui/groups.js",
+  "src/runtime/session.js",
+  "src/api/capture.js",
+  "src/api/frames.js",
+  "src/portal/controls.js",
+  "src/ui/licences.js",
+  "src/api/records.js",
+  "src/exports/downloads.js",
+  "src/ui/rows.js",
+  "src/audio/player.js",
+  "src/exports/actions.js",
+  "src/ui/mount.js",
+  "src/runtime/start.js"
+]
