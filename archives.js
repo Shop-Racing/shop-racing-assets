@@ -1,7 +1,7 @@
 /* Shop-Racing Historique Audio. No credentials are stored or sent outside this session. */
 (function () {
   'use strict';
-  const VERSION = '1.6.2';
+  const VERSION = '1.7.0';
   const MAX_BYTES = 512 * 1024 * 1024;
   const AUDIO_PATH = /\/ptt\/audio(?:;jsessionid=[^/;]+)?\/?$/i;
   function groupPath(path) {
@@ -29,6 +29,20 @@
     const match = /^\s*(.*?)\s*\((\d+)\)\s*$/.exec(String(text || ''));
     const parsed = match && roleLicense(match[1]);
     return match && match[1].trim() ? { id: match[2], label: parsed ? parsed.role + ' ' + parsed.license : match[1].trim(), ...(parsed || {}) } : null;
+  }
+  function timelinePosition(markers, seconds) {
+    if (!markers.length) return null;
+    const t = Math.max(0, Math.min(Number(seconds) || 0, markers[markers.length - 1].end));
+    const marker = markers.find(m => t < m.end) || markers[markers.length - 1];
+    return { marker, seconds: t, time: Number.isFinite(marker.time) ? marker.time + Math.max(0,t-marker.start)*1000 : NaN };
+  }
+  function timelineSeek(markers, time) {
+    for (const marker of markers) {
+      if (!Number.isFinite(marker.time)) continue;
+      if (time <= marker.time) return marker.start;
+      if (time < marker.time + (marker.end-marker.start)*1000) return marker.start + (time-marker.time)/1000;
+    }
+    return markers.length ? markers[markers.length-1].end : 0;
   }
   function timestamp(value) {
     if (value == null || value === '') return NaN;
@@ -174,7 +188,7 @@
     throw new Error('Limite de pagination atteinte : recherche incomplète.');
   }
   if (typeof window === 'undefined' && typeof module === 'object' && module.exports) {
-    module.exports = { safeName, roleLicense, dropdownGroup, timestamp, recordingDates, searchDate, crc32, makeZip, wavHeader, monoPCM, filename, loginRoute, listEnvelope, paginate, portalPages, AUDIO_PATH, groupPath }; return;
+    module.exports = { safeName, roleLicense, dropdownGroup, timelinePosition, timelineSeek, timestamp, recordingDates, searchDate, crc32, makeZip, wavHeader, monoPCM, filename, loginRoute, listEnvelope, paginate, portalPages, AUDIO_PATH, groupPath }; return;
   }
   if (window.__shopRacingArchives && typeof window.__shopRacingArchives.restore === 'function') {
     window.__shopRacingArchives.restore(); return;
@@ -192,6 +206,7 @@
   let nativeAudioResult = null;
   let onLoginPage = false, authGeneration = 0, sessionTimingFloor = 0, refreshPortalVisibility = () => {};
   let queuePlayer, queueButton, queueStop, queueStatus, queueIndex = -1, queueSkipped = 0;
+  let mergedPlayback = null, timeline, timelineRange, timelineClock, timelineDate, timelineGo;
   const aliasFields = new Map();
   let displayNames = {};
   try {
@@ -596,6 +611,12 @@
       if (parsed) numbers.add(parsed.license);
     }
     licenceNumbers = Array.from(numbers).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+    const previousScope = scopeSelect.value;
+    scopeSelect.replaceChildren();
+    if (licenceNumbers.length) el('option', 'Toute une licence', scopeSelect).value = 'licence';
+    el('option', 'Un groupe seul', scopeSelect).value = 'group';
+    scopeSelect.value = licenceNumbers.length && previousScope !== 'group' ? 'licence' : 'group';
+    syncScopeControls();
     renderLicenceMenu(false);
   }
   function renderLicenceMenu(filter) {
@@ -684,7 +705,7 @@
     busy = value; loadButton.disabled = value; zipButton.disabled = value || !complete || !records.length;
     dateInput.disabled = value; scopeSelect.disabled = value; groupSelect.disabled = value;
     mergeButton.disabled = value || !complete || !records.length;
-    queueButton.disabled = value || !records.some(r => r.url);
+    queueButton.disabled = value || !complete || !records.some(r => r.url);
     licence.disabled = value; licenceToggle.disabled = value; if (value) showLicenceMenu(false); cancelButton.hidden = !value;
   }
   function message(text) { status.textContent = text; }
@@ -871,12 +892,15 @@
   }
   function stopQueue(text) {
     queueIndex = -1;
+    if (mergedPlayback) { revokeOutputURL(mergedPlayback.url); mergedPlayback = null; }
+    if (timeline) timeline.hidden = true;
     if (!queuePlayer) return;
     queuePlayer.pause(); queuePlayer.removeAttribute('src'); queuePlayer.load?.();
     queueButton.textContent = 'Tout écouter'; queueStop.disabled = true;
     queueStatus.textContent = text || 'Lecture des échanges dans l’ordre chronologique.';
   }
   function updateQueueLabel() {
+    if (mergedPlayback) { updateTimeline(); return; }
     const r = records[queueIndex]; if (!r) return;
     queueStatus.textContent = 'Écoute ' + (queueIndex + 1) + '/' + records.length + ' · ' + groupLabel(r) + ' · ' + r.user +
       (Number.isFinite(r.time) ? ' · ' + new Date(r.time).toLocaleString('fr-FR') : '') + (queueSkipped ? ' · ' + queueSkipped + ' indisponibles ignorés' : '');
@@ -889,7 +913,27 @@
     try { await queuePlayer.play(); }
     catch (_) { if (queueIndex === index) { queueButton.textContent = 'Reprendre'; queueStatus.textContent += ' — Cliquez sur Reprendre pour lancer la lecture.'; } }
   }
-  async function exportMerged() {
+  function updateTimeline() {
+    if (!mergedPlayback) return;
+    const position = timelinePosition(mergedPlayback.markers, queuePlayer.currentTime);
+    if (!position) return;
+    queueIndex = position.marker.index;
+    timelineRange.value = String(position.seconds);
+    const clock = Number.isFinite(position.time) ? new Date(position.time).toLocaleString('fr-FR', {hour12:false}) : 'Heure inconnue';
+    timelineClock.textContent = clock;
+    const r = records[queueIndex];
+    queueStatus.textContent = 'Audio complet · ' + clock + ' · ' + groupLabel(r) + ' · ' + r.user + (mergedPlayback.failures ? ' · Lecture partielle : ' + mergedPlayback.failures + ' indisponibles' : '');
+  }
+  function installMergedPlayback(blob, markers, failures) {
+    stopQueue();
+    const url = createOutputURL(blob);
+    mergedPlayback = {url, markers, failures};
+    queuePlayer.src = url; queuePlayer.currentTime = 0; queueIndex = markers[0].index;
+    timelineRange.max = String(markers[markers.length-1].end); timelineRange.value = '0';
+    timeline.hidden = false; queueStop.disabled = false;
+    updateTimeline();
+  }
+  async function exportMerged(playback = false) {
     if (busy || !complete || !records.length) return;
     const Audio = window.AudioContext || window.webkitAudioContext;
     if (!Audio) { message('La fusion audio n’est pas prise en charge par ce navigateur.'); return; }
@@ -898,7 +942,7 @@
     try {
       context = new Audio({ sampleRate: 24000 });
       if (context.resume) await context.resume();
-      const chunks = [], mergedRecords = []; let size = 0, failures = 0;
+      const chunks = [], mergedRecords = [], markers = []; let size = 0, failures = 0, duration = 0;
       progress.max = records.length; progress.value = 0;
       for (let i = 0; i < records.length; i++) {
         if (signal.aborted) throw new DOMException('Cancelled', 'AbortError');
@@ -908,12 +952,17 @@
           const decoded = await context.decodeAudioData(file.bytes.buffer);
           if (decoded.length * 2 + size > MAX_BYTES) throw new RangeError('Fusion limitée à 512 Mo. Exportez une période plus courte.');
           if (signal.aborted) throw new DOMException('Cancelled', 'AbortError');
-          const pcm = monoPCM(decoded); chunks.push(pcm); mergedRecords.push(records[i]); size += pcm.length;
+          const pcm = monoPCM(decoded);
+          if (!pcm.length) throw new Error('Audio vide');
+          const end = duration + pcm.length / 2 / context.sampleRate;
+          markers.push({start:duration,end,index:i,time:records[i].time}); duration = end;
+          chunks.push(pcm); mergedRecords.push(records[i]); size += pcm.length;
         } catch (e) { if (signal.aborted || e instanceof RangeError) throw e; failures++; }
         progress.value = i + 1;
       }
       if (!chunks.length) { message('Aucun audio décodable : accès CORS ou format non pris en charge. Aucun fichier créé.'); return; }
       const blob = new Blob([wavHeader(size, context.sampleRate), ...chunks], { type: 'audio/wav' });
+      installMergedPlayback(blob, markers, failures);
       const name = 'Shop-Racing_' + recordingDates(mergedRecords) + '_' + safeName(scopeTitle()) + '_Echanges-chronologiques' + (failures ? '_PARTIEL' : '') + '.wav';
       message('Audio unique prêt : ' + chunks.length + '/' + records.length + ' enregistrements, à la suite sans les temps de silence entre échanges.' + (failures ? ' ' + failures + ' échecs : fichier partiel.' : ''));
       const save = el('button', 'Télécharger l’audio unique', status), url = createOutputURL(blob);
@@ -923,6 +972,10 @@
         setTimeout(() => revokeOutputURL(url), 60000);
       };
       setTimeout(() => { revokeOutputURL(url); if (save.isConnected) { save.disabled = true; save.textContent = 'Fichier expiré — relancez la fusion'; } }, 600000);
+      if (playback) {
+        try { await queuePlayer.play(); }
+        catch (_) { queueButton.textContent = 'Reprendre'; message('Audio complet prêt. Cliquez sur Reprendre pour écouter.'); }
+      }
     } catch (e) { message(signal.aborted ? 'Fusion annulée.' : (e instanceof RangeError ? e.message : 'Fusion impossible. Aucun téléchargement demandé.')); }
     finally { if (context) await context.close().catch(() => {}); setBusy(false); }
   }
@@ -1053,7 +1106,7 @@
     dateInput.type = 'datetime-local'; dateInput.step = '1'; dateInput.required = true;
     loadButton = el('button', 'Charger les archives', tools); loadButton.onclick = load;
     zipButton = el('button', 'Exporter tous les audios en ZIP', tools); zipButton.disabled = true; zipButton.onclick = exportZip;
-    mergeButton = el('button', 'Créer un audio unique (WAV)', tools); mergeButton.disabled = true; mergeButton.onclick = exportMerged;
+    mergeButton = el('button', 'Créer un audio unique (WAV)', tools); mergeButton.disabled = true; mergeButton.onclick = () => exportMerged(false);
     cancelButton = el('button', 'Annuler', tools); cancelButton.hidden = true; cancelButton.onclick = () => controller && controller.abort();
     const labels = el('details', null, panel); el('summary', 'Modifier les libellés des groupes', labels);
     el('p', 'Pour la licence choisie : personnalisez les noms affichés et exportés. Laissez vide pour garder le nom d’origine. Réglages mémorisés dans ce navigateur.', labels);
@@ -1074,19 +1127,36 @@
     };
     const listening = el('div', null, panel); listening.className = 'tools';
     queueButton = el('button', 'Tout écouter', listening); queueButton.disabled = true;
-    queueStop = el('button', 'Arrêter', listening); queueStop.disabled = true; queueStop.onclick = () => stopQueue();
+    queueStop = el('button', 'Arrêter', listening); queueStop.disabled = true; queueStop.onclick = () => { if (mergedPlayback) { queuePlayer.pause(); queuePlayer.currentTime = 0; updateTimeline(); } else stopQueue(); };
     queuePlayer = el('audio', null, listening); queuePlayer.controls = true; queuePlayer.preload = 'none'; queuePlayer.setAttribute('aria-label', 'Lecture successive des archives');
     queueStatus = el('p', 'Lecture des échanges dans l’ordre chronologique.', panel); queueStatus.setAttribute('role', 'status');
     queuePlayer.onplay = () => { queueButton.textContent = 'Pause'; };
     queuePlayer.onpause = () => { if (queueIndex >= 0) queueButton.textContent = 'Reprendre'; };
-    queuePlayer.onended = () => { if (queueIndex >= 0) playQueue(queueIndex + 1); };
-    queuePlayer.onerror = () => { if (queueIndex >= 0) { queueSkipped++; playQueue(queueIndex + 1); } };
+    queuePlayer.onended = () => { if (mergedPlayback) { updateTimeline(); queueButton.textContent = 'Reprendre'; } else if (queueIndex >= 0) playQueue(queueIndex + 1); };
+    queuePlayer.onerror = () => { if (mergedPlayback) { message('Lecture de l’audio complet impossible. Relancez sa préparation.'); return; } if (queueIndex >= 0) { queueSkipped++; playQueue(queueIndex + 1); } };
     queueButton.onclick = async () => {
       if (busy) return;
       if (queueIndex >= 0) { if (queuePlayer.paused) { try { await queuePlayer.play(); } catch (_) {} } else queuePlayer.pause(); return; }
       for (const audio of tbody.querySelectorAll('audio')) audio.pause();
-      queueSkipped = 0; await playQueue(0);
+      queueSkipped = 0;
+      if (window.AudioContext || window.webkitAudioContext) await exportMerged(true);
+      else await playQueue(0);
     };
+    timeline = el('div', null, panel); timeline.className = 'audio-timeline'; timeline.hidden = true;
+    timelineClock = el('output', '—', timeline); timelineClock.setAttribute('aria-label', 'Date et heure de l’enregistrement');
+    timelineRange = el('input', null, timeline); timelineRange.type = 'range'; timelineRange.min = '0'; timelineRange.step = '0.01'; timelineRange.value = '0';
+    timelineRange.setAttribute('aria-label', 'Naviguer dans tous les échanges');
+    timelineRange.oninput = () => { if (mergedPlayback) { queuePlayer.currentTime = Number(timelineRange.value); updateTimeline(); } };
+    const jump = el('div', null, timeline); jump.className = 'tools';
+    const jumpLabel = el('label', 'Aller à l’heure', jump); timelineDate = el('input', null, jumpLabel); timelineDate.type = 'datetime-local'; timelineDate.step = '1';
+    timelineGo = el('button', 'Aller', jump); timelineGo.onclick = () => {
+      if (!mergedPlayback || !timelineDate.value) return;
+      const time = timestamp(timelineDate.value); if (!Number.isFinite(time)) return;
+      queuePlayer.currentTime = timelineSeek(mergedPlayback.markers, time); updateTimeline();
+    };
+    el('small', 'Échanges à la suite, sans les silences entre appels. L’heure affichée correspond à l’enregistrement d’origine. Une heure sans échange mène au suivant.', timeline);
+    queuePlayer.ontimeupdate = updateTimeline; queuePlayer.onseeked = updateTimeline;
+    const timelineStyle = el('style', '.audio-timeline{padding:16px;margin:14px 0;background:#202a3d;border:1px solid #414b60;border-radius:10px}.audio-timeline output{display:block;font-size:20px;font-variant-numeric:tabular-nums;margin-bottom:8px}.audio-timeline input[type=range]{display:block;width:100%;max-width:none;padding:0;margin:12px 0;accent-color:#f57920}.audio-timeline small{display:block;margin-top:10px}', root);
     queryBox = el('details', null, panel); queryBox.hidden = true; queryBox.open = true;
     el('summary', 'Query de session — solution de secours', queryBox);
     const queryLabel = el('label', 'Query', queryBox); const input = el('input', null, queryLabel);
