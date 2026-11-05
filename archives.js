@@ -1,7 +1,7 @@
 /* Shop-Racing Historique Audio. No credentials are stored or sent outside this session. */
 (function () {
   'use strict';
-  const VERSION = '1.6.0';
+  const VERSION = '1.6.1';
   const MAX_BYTES = 512 * 1024 * 1024;
   const AUDIO_PATH = /\/ptt\/audio(?:;jsessionid=[^/;]+)?\/?$/i;
   function groupPath(path) {
@@ -28,7 +28,7 @@
   function dropdownGroup(text) {
     const match = /^\s*(.*?)\s*\((\d+)\)\s*$/.exec(String(text || ''));
     const parsed = match && roleLicense(match[1]);
-    return parsed ? { id: match[2], label: parsed.role + ' ' + parsed.license, ...parsed } : null;
+    return match && match[1].trim() ? { id: match[2], label: parsed ? parsed.role + ' ' + parsed.license : match[1].trim(), ...(parsed || {}) } : null;
   }
   function timestamp(value) {
     if (value == null || value === '') return NaN;
@@ -658,17 +658,17 @@
           const initial = searchDate(pageDateInput()?.value) || searchDate(sessionURL?.searchParams.get('start_time'));
           if (initial) dateInput.value = initial.replace(' ', 'T');
         }
-        if (!sessionURL && !await detectWithNativeQuery(false, searchDate(dateInput.value), licence.value || hints[0]?.license)) return;
+        if (!sessionURL && !await detectWithNativeQuery(false, searchDate(dateInput.value), licence.value || hints.find(g => g.license)?.license, hints[0]?.id)) return;
         const u = new URL(sessionURL); u.pathname = groupPath(u.pathname);
         u.searchParams.set('method', 'get'); u.searchParams.set('group_id', '');
         for (const key of ['group_id', 'group_name', 'order_type', 'codec_type', 'time', 'audio_id', 'user_id', 'start_time', 'end_time', 'begin_time', 'start_date', 'end_date', 'date', 'keyword']) u.searchParams.delete(key);
         const signal = new AbortController().signal;
-        message('Recherche des licences disponibles…');
+        message('Recherche des groupes et licences disponibles…');
         const groups = await portalPages(u, 'group', url => jsonRequest(url, { ...capturedHeaders }, signal));
         offerLicences([...hints, ...groups]);
-        message('Choisissez une licence dans la liste ou saisissez son numéro.');
+        message(scopeSelect.value === 'group' ? 'Choisissez le groupe à écouter.' : 'Choisissez une licence dans la liste ou saisissez son numéro.');
       } catch (_) {
-        message('Liste de licences partielle ou indisponible. Vous pouvez saisir le numéro au clavier.');
+        message(scopeSelect.value === 'group' ? (availableGroups.size ? 'Choisissez un groupe disponible dans la liste du portail.' : 'Aucun groupe détecté. Vérifiez la liste Select Group du portail pour ce compte.') : 'Liste de licences partielle ou indisponible. Vous pouvez saisir le numéro au clavier.');
       } finally { suggestionsTask = null; loadButton.disabled = busy; }
     })();
   }
@@ -1101,7 +1101,7 @@
       }
       if (!licence.value) {
         const selected = Array.from(dropdownGroups().values());
-        if (selected.length === 1) licence.value = selected[0].license;
+        if (selected.length === 1 && selected[0].license) licence.value = selected[0].license;
       }
       refreshLabelFields();
       if (!busy && !records.length) message(sessionURL ? 'Session détectée. Saisissez votre licence.' : 'Ouvrez une recherche audio dans le portail, puis cliquez sur Charger les archives.');
