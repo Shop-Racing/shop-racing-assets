@@ -1,7 +1,7 @@
 /* Shop-Racing Historique Audio. No credentials are stored or sent outside this session. */
 (function () {
   'use strict';
-  const VERSION = '1.6.1';
+  const VERSION = '1.6.2';
   const MAX_BYTES = 512 * 1024 * 1024;
   const AUDIO_PATH = /\/ptt\/audio(?:;jsessionid=[^/;]+)?\/?$/i;
   function groupPath(path) {
@@ -211,7 +211,8 @@
   function scopeTitle() {
     return loadedScope?.kind === 'group' ? 'Groupe-' + groupLabel({ group: loadedScope.group }) : 'Licence-' + (loadedScope?.number || licence.value);
   }
-  function offerGroups(groups) {
+  function offerGroups(groups, replace = false) {
+    if (replace) availableGroups.clear();
     for (const g of groups) {
       const id = g.id ?? g.group_id ?? g.groupId;
       const name = g.group_name ?? g.name ?? g.groupName ?? g.label;
@@ -455,9 +456,23 @@
   function dropdownGroups() {
     const found = new Map();
     for (const root of portalRoots()) {
-      for (const node of root.querySelectorAll('.audio-records .el-select input, .audio-records select option, .el-select-dropdown__item, [role="option"]')) {
+      for (const node of root.querySelectorAll('.audio-records .el-select input, .audio-records select option, .audio-records .el-select-dropdown__item')) {
         const group = dropdownGroup(node.value || node.textContent);
         if (group) found.set(group.id, group);
+      }
+    }
+    // Read options owned by the audio selector, including its detached menu.
+    // Never use the company-wide group endpoint as evidence of user membership.
+    for (const root of portalRoots()) for (const select of root.querySelectorAll('.audio-records .filter-box .el-select')) {
+      const component = select.__vue__;
+      for (const option of [...(component?.options || []), ...(component?.cachedOptions || [])]) {
+        const group = dropdownGroup(option.currentLabel || option.label);
+        const id = option.value;
+        if (group) found.set(group.id, group);
+        else if (id != null && /^\d+$/.test(String(id))) {
+          const label = String(option.currentLabel || option.label || '').trim();
+          if (label) found.set(String(id), {id:String(id),label,...(roleLicense(label) || {})});
+        }
       }
     }
     return found;
@@ -574,7 +589,7 @@
     });
   }
   function offerLicences(groups) {
-    offerGroups(groups);
+    offerGroups(groups, true);
     const numbers = new Set();
     for (const group of groups) {
       const parsed = group.license ? group : roleLicense(group.name ?? group.group_name ?? group.groupName);
@@ -658,15 +673,8 @@
           const initial = searchDate(pageDateInput()?.value) || searchDate(sessionURL?.searchParams.get('start_time'));
           if (initial) dateInput.value = initial.replace(' ', 'T');
         }
-        if (!sessionURL && !await detectWithNativeQuery(false, searchDate(dateInput.value), licence.value || hints.find(g => g.license)?.license, hints[0]?.id)) return;
-        const u = new URL(sessionURL); u.pathname = groupPath(u.pathname);
-        u.searchParams.set('method', 'get'); u.searchParams.set('group_id', '');
-        for (const key of ['group_id', 'group_name', 'order_type', 'codec_type', 'time', 'audio_id', 'user_id', 'start_time', 'end_time', 'begin_time', 'start_date', 'end_date', 'date', 'keyword']) u.searchParams.delete(key);
-        const signal = new AbortController().signal;
-        message('Recherche des groupes et licences disponibles…');
-        const groups = await portalPages(u, 'group', url => jsonRequest(url, { ...capturedHeaders }, signal));
-        offerLicences([...hints, ...groups]);
-        message(scopeSelect.value === 'group' ? 'Choisissez le groupe à écouter.' : 'Choisissez une licence dans la liste ou saisissez son numéro.');
+        offerLicences(Array.from(dropdownGroups().values()));
+        message(scopeSelect.value === 'group' ? 'Choisissez un groupe accessible à votre compte.' : 'Choisissez une licence accessible à votre compte.');
       } catch (_) {
         message(scopeSelect.value === 'group' ? (availableGroups.size ? 'Choisissez un groupe disponible dans la liste du portail.' : 'Aucun groupe détecté. Vérifiez la liste Select Group du portail pour ce compte.') : 'Liste de licences partielle ou indisponible. Vous pouvez saisir le numéro au clavier.');
       } finally { suggestionsTask = null; loadButton.disabled = busy; }
@@ -733,7 +741,17 @@
     if (!chosenDate) { message('Choisissez une date et une heure valides pour la recherche.'); dateInput.focus(); return; }
     {
       setBusy(true);
-      try { await detectWithNativeQuery(true, chosenDate, singleGroup ? null : number, selectedGroup?.id); } finally { setBusy(false); }
+      try {
+        await ensureAudioPage();
+        const allowed = dropdownGroups();
+        offerLicences(Array.from(allowed.values()));
+        if (singleGroup ? !allowed.has(selectedGroup.id) : !Array.from(allowed.values()).some(g => g.license === number)) {
+          message(singleGroup ? 'Ce groupe ne figure pas dans les groupes accessibles à votre compte.' : 'Aucun groupe correspondant à cette licence dans les groupes accessibles à votre compte.');
+          return;
+        }
+        await detectWithNativeQuery(true, chosenDate, singleGroup ? null : number, selectedGroup?.id);
+      } catch (e) { message(e.message || 'Impossible de vérifier les groupes accessibles.'); return; }
+      finally { setBusy(false); }
     }
     if (nativeQueryIssue) { message(nativeQueryIssue); return; }
     if (!sessionURL) {
@@ -750,26 +768,13 @@
     controller = new AbortController(); const signal = controller.signal;
     const base = new URL(sessionURL), headers = { ...capturedHeaders };
     base.searchParams.set('start_time', chosenDate);
-    // Empty group_id reuses the authenticated session without narrowing the group discovery.
-    base.searchParams.set('group_id', '');
-    const groupURL = new URL(base); groupURL.pathname = groupPath(groupURL.pathname);
-    let stage = 'Recherche des groupes';
-    groupURL.searchParams.set('method', 'get');
-    for (const key of ['audio_id', 'user_id', 'group_id', 'group_name', 'order_type', 'codec_type', 'time', 'start_time', 'end_time', 'begin_time', 'start_date', 'end_date', 'date', 'keyword']) {
-      groupURL.searchParams.delete(key);
-    }
+    let stage = 'Recherche des groupes accessibles';
     try {
-      message('Recherche de tous les groupes…'); progress.removeAttribute('value');
-      const groups = await portalPages(groupURL, 'group', u => jsonRequest(u, headers, signal), n => message(n + ' groupes examinés…'));
+      const allowed = dropdownGroups();
+      offerLicences(Array.from(allowed.values()));
       candidates.clear();
-      // UI hints complement the full API listing; they never prove that every group is loaded.
-      for (const g of dropdownGroups().values()) if (singleGroup ? g.id === selectedGroup.id : g.license === number) candidates.set(g.id, { id: g.id, label: g.label });
-      for (const g of groups) {
-        const parsed = roleLicense(g.name ?? g.group_name ?? g.groupName);
-        const id = g.id ?? g.group_id ?? g.groupId;
-        if (id != null && (singleGroup ? String(id) === selectedGroup.id : parsed?.license === number))
-          candidates.set(String(id), { id: String(id), label: singleGroup ? selectedGroup.label : parsed.role + ' ' + parsed.license });
-      }
+      for (const g of allowed.values()) if (singleGroup ? g.id === selectedGroup.id : g.license === number)
+        candidates.set(g.id, {id:g.id,label:g.label});
       if (!candidates.size) { complete = true; message(singleGroup ? 'Ce groupe n’est plus disponible.' : 'Aucun groupe correspondant à cette licence.'); return; }
       const unique = new Map(); let index = 0;
       for (const g of candidates.values()) {
